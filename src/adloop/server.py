@@ -2815,6 +2815,80 @@ def draft_remove_conversion_action(
     )
 
 
+@mcp.tool(annotations=_WRITE)
+@_safe
+def draft_upload_call_conversions(
+    csv_path: str,
+    partial_failure: bool = True,
+    customer_id: str = "",
+) -> dict:
+    """Draft a CSV upload of call conversions to Google Ads — returns PREVIEW.
+
+    Reads any CSV matching Google Ads' call-upload schema and previews what
+    will be pushed via ConversionUploadService.UploadCallConversions.
+
+    The CSV must contain these columns (Parameters/comment rows ignored):
+      - Caller's Phone Number   (E.164 format, e.g. +19162264625)
+      - Call Start Time         (ISO 8601, e.g. 2026-02-26T16:49:44Z)
+      - Conversion Name         (must EXACTLY match an UPLOAD_CALLS-typed
+                                 conversion action that already exists)
+      - Conversion Time         (ISO 8601)
+      - Conversion Value        (numeric)
+      - Conversion Currency     (ISO 3-letter, e.g. USD)
+
+    partial_failure (default True): Google accepts the parseable rows and
+    reports only the bad ones — recommended for batch uploads.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+
+    Use this when GCLID isn't flowing through your CRM and the Web UI's
+    generic Uploads page rejects call CSVs (which it does — that page
+    only accepts click conversions).
+    """
+    from adloop.ads.conversion_actions import draft_upload_call_conversions as _impl
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        csv_path=csv_path,
+        partial_failure=partial_failure,
+    )
+
+
+@mcp.tool(annotations=_WRITE)
+@_safe
+def draft_upload_enhanced_conversions_for_leads(
+    csv_path: str,
+    partial_failure: bool = True,
+    customer_id: str = "",
+) -> dict:
+    """Draft an Enhanced Conversions for Leads upload — returns PREVIEW.
+
+    Reads a SHA-256-hashed PII CSV (Email, Phone Number, First Name, Last
+    Name + conversion details) and previews what will be pushed via
+    ConversionUploadService.UploadClickConversions with user_identifiers
+    populated.
+
+    The target conversion action (named in the CSV's "Conversion Name"
+    column) must be of type UPLOAD_CLICKS. Works RETROACTIVELY — Google
+    matches hashed identifiers to past ad clicks, no "action must exist
+    before call" constraint.
+
+    Use this path when GCLID isn't flowing and you need to upload
+    historical lead/job conversion data.
+    """
+    from adloop.ads.conversion_actions import (
+        draft_upload_enhanced_conversions_for_leads as _impl,
+    )
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        csv_path=csv_path,
+        partial_failure=partial_failure,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Asset in-place updates (call asset, sitelink, callout)
 # ---------------------------------------------------------------------------

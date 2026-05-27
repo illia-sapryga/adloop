@@ -456,3 +456,501 @@ class TestMCPRegistration:
         assert '"create_conversion_action": _apply_create_conversion_action_route' in src
         assert '"update_conversion_action": _apply_update_conversion_action_route' in src
         assert '"remove_conversion_action": _apply_remove_conversion_action_route' in src
+        assert '"upload_call_conversions": _apply_upload_call_conversions_route' in src
+
+    def test_upload_call_conversions_tool_registered(self, tools_by_name):
+        assert "draft_upload_call_conversions" in tools_by_name
+
+    def test_upload_call_conversions_requires_csv_path(self, tools_by_name):
+        required = (
+            tools_by_name["draft_upload_call_conversions"]
+            .parameters.get("required", [])
+        )
+        assert "csv_path" in required
+
+
+# ---------------------------------------------------------------------------
+# Call-conversion CSV parsing helpers
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeCallTimestamp:
+    def test_strips_fractional_seconds_and_z(self):
+        out = conversion_actions._normalize_call_timestamp(
+            "2026-02-26T16:49:44.5679977Z"
+        )
+        assert out == "2026-02-26 16:49:44+00:00"
+
+    def test_replaces_t_only(self):
+        out = conversion_actions._normalize_call_timestamp(
+            "2026-02-26T16:49:44Z"
+        )
+        assert out == "2026-02-26 16:49:44+00:00"
+
+    def test_preserves_offset(self):
+        out = conversion_actions._normalize_call_timestamp(
+            "2026-02-26T16:49:44.123-08:00"
+        )
+        assert out == "2026-02-26 16:49:44-08:00"
+
+    def test_empty(self):
+        assert conversion_actions._normalize_call_timestamp("") == ""
+
+
+class TestParseCallConversionCsv:
+    def _write_csv(self, tmp_path, content):
+        p = tmp_path / "phone.csv"
+        p.write_text(content)
+        return str(p)
+
+    def test_missing_file(self, tmp_path):
+        rows, errors = conversion_actions._parse_call_conversion_csv(
+            str(tmp_path / "does-not-exist.csv")
+        )
+        assert rows == []
+        assert any("not found" in e for e in errors)
+
+    def test_skips_parameters_and_comments(self, tmp_path):
+        csv_text = (
+            "Parameters:TimeZone=America/Los_Angeles,,,,,,\n"
+            "Caller's Phone Number,Call Start Time,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,"
+            "Ad User Data,Ad Personalization\n"
+            "+19165550100,2026-03-01T12:00:00Z,Test Action,"
+            "2026-03-01T13:00:00Z,250.00,USD,,\n"
+        )
+        path = self._write_csv(tmp_path, csv_text)
+        rows, errors = conversion_actions._parse_call_conversion_csv(path)
+        assert errors == []
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["caller_id"] == "+19165550100"
+        assert r["call_start_time"] == "2026-03-01 12:00:00+00:00"
+        assert r["conversion_name"] == "Test Action"
+        assert r["conversion_value"] == 250.0
+        assert r["currency_code"] == "USD"
+
+    def test_missing_required_column(self, tmp_path):
+        csv_text = (
+            "Caller's Phone Number,Call Start Time,Conversion Name,"
+            "Conversion Time,Conversion Value\n"  # missing Currency
+            "+19165550100,2026-03-01T12:00:00Z,X,2026-03-01T13:00:00Z,1\n"
+        )
+        path = self._write_csv(tmp_path, csv_text)
+        rows, errors = conversion_actions._parse_call_conversion_csv(path)
+        assert rows == []
+        assert any("Conversion Currency" in e for e in errors)
+
+    def test_invalid_value_row_skipped(self, tmp_path):
+        csv_text = (
+            "Caller's Phone Number,Call Start Time,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "+19165550100,2026-03-01T12:00:00Z,X,2026-03-01T13:00:00Z,not-a-num,USD\n"
+            "+19165550101,2026-03-01T12:01:00Z,X,2026-03-01T13:01:00Z,99.0,USD\n"
+        )
+        path = self._write_csv(tmp_path, csv_text)
+        rows, errors = conversion_actions._parse_call_conversion_csv(path)
+        assert len(rows) == 1
+        assert rows[0]["caller_id"] == "+19165550101"
+        assert any("Conversion Value" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Draft validation for upload_call_conversions
+# ---------------------------------------------------------------------------
+
+
+class TestDraftUploadCallConversions:
+    def _write_valid_csv(self, tmp_path):
+        p = tmp_path / "phone.csv"
+        p.write_text(
+            "Parameters:TimeZone=America/Los_Angeles,,,,,,\n"
+            "Caller's Phone Number,Call Start Time,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,"
+            "Ad User Data,Ad Personalization\n"
+            "+19165550100,2026-03-01T12:00:00Z,A,2026-03-01T13:00:00Z,250.00,USD,,\n"
+            "+19165550101,2026-03-02T12:00:00Z,A,2026-03-02T13:00:00Z,500.00,USD,,\n"
+            "+19165550102,2026-03-03T12:00:00Z,B,2026-03-03T13:00:00Z,75.00,USD,,\n"
+        )
+        return str(p)
+
+    def test_missing_csv_returns_error(self, config, tmp_path):
+        result = conversion_actions.draft_upload_call_conversions(
+            config,
+            customer_id="1234567890",
+            csv_path=str(tmp_path / "missing.csv"),
+        )
+        assert "error" in result
+
+    def test_happy_path_preview(self, config, tmp_path):
+        path = self._write_valid_csv(tmp_path)
+        result = conversion_actions.draft_upload_call_conversions(
+            config,
+            customer_id="1234567890",
+            csv_path=path,
+        )
+        assert "plan_id" in result
+        assert result["operation"] == "upload_call_conversions"
+        assert result["entity_type"] == "call_conversion_batch"
+        c = result["changes"]
+        assert c["row_count"] == 3
+        assert c["total_value"] == 825.00
+        assert c["distinct_conversion_actions"] == ["A", "B"]
+        assert c["partial_failure"] is True
+        assert len(c["sample_rows"]) == 3
+        assert c["sample_rows"][0]["caller_id"] == "+19165550100"
+
+    def test_plan_stored(self, config, tmp_path):
+        path = self._write_valid_csv(tmp_path)
+        result = conversion_actions.draft_upload_call_conversions(
+            config, customer_id="1234567890", csv_path=path,
+        )
+        plan = preview_store.get_plan(result["plan_id"])
+        assert plan is not None
+        assert plan.operation == "upload_call_conversions"
+        assert plan.changes["csv_path"] == path
+
+    def test_safety_blocked_operation(self, tmp_path):
+        from adloop.config import AdLoopConfig, AdsConfig, SafetyConfig
+        cfg = AdLoopConfig(
+            ads=AdsConfig(customer_id="123-456-7890"),
+            safety=SafetyConfig(blocked_operations=["upload_call_conversions"]),
+        )
+        path = self._write_valid_csv(tmp_path)
+        result = conversion_actions.draft_upload_call_conversions(
+            cfg, customer_id="1234567890", csv_path=path,
+        )
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Apply (mock upload + GAQL action-name lookup)
+# ---------------------------------------------------------------------------
+
+
+class _FakeUploadService:
+    def __init__(self, results_count: int = 0, error_message: str = ""):
+        self.called_with: dict | None = None
+        self._results_count = results_count
+        self._error_message = error_message
+
+    def upload_call_conversions(self, *, customer_id, conversions, partial_failure):
+        self.called_with = {
+            "customer_id": customer_id,
+            "conversions": list(conversions),
+            "partial_failure": partial_failure,
+        }
+        results = [
+            SimpleNamespace(caller_id=c.caller_id) for c in conversions[:self._results_count]
+        ] + [SimpleNamespace(caller_id="") for _ in conversions[self._results_count:]]
+        partial = SimpleNamespace(
+            message=self._error_message, code=0
+        ) if self._error_message else SimpleNamespace(message="", code=0)
+        return SimpleNamespace(results=results, partial_failure_error=partial)
+
+
+class _FakeSearchRow:
+    def __init__(self, name: str, resource_name: str, type_name: str = "UPLOAD_CALLS"):
+        self.conversion_action = SimpleNamespace(
+            name=name,
+            resource_name=resource_name,
+            type_=SimpleNamespace(name=type_name),
+            status=SimpleNamespace(name="ENABLED"),
+            id=int(resource_name.split("/")[-1]),
+        )
+
+
+class _FakeGoogleAdsService:
+    def __init__(self, rows: list):
+        self._rows = rows
+        self.last_query = ""
+
+    def search(self, *, customer_id, query):
+        self.last_query = query
+        return iter(self._rows)
+
+
+def _client_with(*, upload_service, ads_service):
+    fake = _FakeClient({
+        "ConversionUploadService": upload_service,
+        "GoogleAdsService": ads_service,
+    })
+    return fake
+
+
+class TestApplyUploadCallConversions:
+    def _make_changes(self, tmp_path):
+        p = tmp_path / "phone.csv"
+        p.write_text(
+            "Parameters:TimeZone=America/Los_Angeles,,,,,,\n"
+            "Caller's Phone Number,Call Start Time,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,"
+            "Ad User Data,Ad Personalization\n"
+            "+19165550100,2026-03-01T12:00:00Z,My Action,"
+            "2026-03-01T13:00:00Z,250.00,USD,,\n"
+            "+19165550101,2026-03-02T12:00:00Z,My Action,"
+            "2026-03-02T13:00:00Z,500.00,USD,,\n"
+        )
+        return {
+            "csv_path": str(p),
+            "row_count": 2,
+            "partial_failure": True,
+        }
+
+    def test_full_success(self, tmp_path):
+        upload = _FakeUploadService(results_count=2)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow("My Action", "customers/1/conversionActions/777")
+        ])
+        client = _client_with(upload_service=upload, ads_service=ads)
+
+        result = conversion_actions._apply_upload_call_conversions(
+            client, "1", self._make_changes(tmp_path)
+        )
+
+        assert result["uploaded_total"] == 2
+        assert result["success_count"] == 2
+        assert result["failure_count"] == 0
+        assert result["conversion_actions_used"] == {
+            "My Action": "customers/1/conversionActions/777"
+        }
+        # Verify the API got the right shape
+        assert upload.called_with["customer_id"] == "1"
+        assert upload.called_with["partial_failure"] is True
+        sent = upload.called_with["conversions"]
+        assert len(sent) == 2
+        assert sent[0].caller_id == "+19165550100"
+        assert sent[0].conversion_action == "customers/1/conversionActions/777"
+        assert sent[0].conversion_value == 250.0
+        assert sent[0].currency_code == "USD"
+        # Timestamp normalized
+        assert sent[0].call_start_date_time == "2026-03-01 12:00:00+00:00"
+
+    def test_partial_failure_message_surfaced(self, tmp_path):
+        upload = _FakeUploadService(
+            results_count=1, error_message="one row was bad"
+        )
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow("My Action", "customers/1/conversionActions/777")
+        ])
+        client = _client_with(upload_service=upload, ads_service=ads)
+
+        result = conversion_actions._apply_upload_call_conversions(
+            client, "1", self._make_changes(tmp_path)
+        )
+
+        assert result["success_count"] == 1
+        assert result["failure_count"] == 1
+        assert any(
+            e["type"] == "partial_failure" and e["message"] == "one row was bad"
+            for e in result["row_errors"]
+        )
+
+    def test_action_not_found_raises(self, tmp_path):
+        upload = _FakeUploadService(results_count=0)
+        ads = _FakeGoogleAdsService([])  # No matching action
+        client = _client_with(upload_service=upload, ads_service=ads)
+
+        with pytest.raises(ValueError) as exc:
+            conversion_actions._apply_upload_call_conversions(
+                client, "1", self._make_changes(tmp_path)
+            )
+        assert "not found" in str(exc.value)
+
+    def test_wrong_type_raises(self, tmp_path):
+        upload = _FakeUploadService(results_count=0)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Action",
+                "customers/1/conversionActions/777",
+                type_name="UPLOAD_CLICKS",  # Wrong — should be UPLOAD_CALLS
+            )
+        ])
+        client = _client_with(upload_service=upload, ads_service=ads)
+
+        with pytest.raises(ValueError) as exc:
+            conversion_actions._apply_upload_call_conversions(
+                client, "1", self._make_changes(tmp_path)
+            )
+        assert "UPLOAD_CALLS" in str(exc.value)
+
+    def test_empty_csv_returns_error(self, tmp_path):
+        p = tmp_path / "empty.csv"
+        p.write_text("")
+        upload = _FakeUploadService()
+        ads = _FakeGoogleAdsService([])
+        client = _client_with(upload_service=upload, ads_service=ads)
+
+        result = conversion_actions._apply_upload_call_conversions(
+            client, "1", {"csv_path": str(p), "partial_failure": True}
+        )
+        assert "error" in result
+        assert upload.called_with is None  # Never called
+
+
+# ---------------------------------------------------------------------------
+# Enhanced Conversions for Leads — parsing + draft + apply
+# ---------------------------------------------------------------------------
+
+
+class TestParseEcForLeadsCsv:
+    def _write(self, tmp_path, content):
+        p = tmp_path / "ec.csv"
+        p.write_text(content)
+        return str(p)
+
+    def test_missing_file(self, tmp_path):
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(
+            str(tmp_path / "missing.csv")
+        )
+        assert rows == []
+        assert any("not found" in e for e in errors)
+
+    def test_happy_path(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaaa,bbbb,cccc,dddd,My Action,2026-03-01T12:00:00Z,250.00,USD\n",
+        )
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(path)
+        assert errors == []
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["email_sha256"] == "aaaa"
+        assert r["phone_sha256"] == "bbbb"
+        assert r["conversion_name"] == "My Action"
+        assert r["conversion_value"] == 250.0
+        assert r["conversion_time"] == "2026-03-01 12:00:00+00:00"
+
+    def test_missing_required_column(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "Email,Phone Number,Conversion Name,Conversion Time,"
+            "Conversion Value,Conversion Currency\n"  # missing First/Last
+            "aaaa,bbbb,X,2026-03-01T12:00:00Z,100,USD\n",
+        )
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(path)
+        assert rows == []
+        assert any("First Name" in e or "Last Name" in e for e in errors)
+
+
+class TestDraftUploadEnhancedConversionsForLeads:
+    def _write(self, tmp_path):
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaa,bbb,ccc,ddd,Job Close,2026-03-01T12:00:00Z,500.00,USD\n"
+            "eee,fff,ggg,hhh,Job Close,2026-03-02T12:00:00Z,1500.00,USD\n"
+            ",zzz,,,Job Close,2026-03-03T12:00:00Z,200.00,USD\n"
+        )
+        return str(p)
+
+    def test_happy_path_preview(self, config, tmp_path):
+        path = self._write(tmp_path)
+        result = conversion_actions.draft_upload_enhanced_conversions_for_leads(
+            config, customer_id="1234567890", csv_path=path,
+        )
+        assert "plan_id" in result
+        assert result["operation"] == "upload_enhanced_conversions_for_leads"
+        c = result["changes"]
+        assert c["row_count"] == 3
+        assert c["total_value"] == 2200.00
+        assert c["rows_with_email"] == 2
+        assert c["rows_with_phone"] == 3
+        assert c["distinct_conversion_actions"] == ["Job Close"]
+        # PII in sample is truncated
+        assert "..." in c["sample_rows"][0]["email_sha256"]
+
+
+class _FakeClickUploadService:
+    def __init__(self, results_count: int = 0, error_message: str = ""):
+        self.called_with: dict | None = None
+        self._results_count = results_count
+        self._error_message = error_message
+
+    def upload_click_conversions(
+        self, *, customer_id, conversions, partial_failure
+    ):
+        self.called_with = {
+            "customer_id": customer_id,
+            "conversions": list(conversions),
+            "partial_failure": partial_failure,
+        }
+        # Mark first N results as having conversion_action set (= success)
+        results = []
+        for i, c in enumerate(conversions):
+            r = SimpleNamespace(
+                conversion_action=c.conversion_action if i < self._results_count else "",
+                gclid="",
+                user_identifiers=[],
+            )
+            results.append(r)
+        partial = SimpleNamespace(
+            message=self._error_message, code=0
+        ) if self._error_message else SimpleNamespace(message="", code=0)
+        return SimpleNamespace(results=results, partial_failure_error=partial)
+
+
+def _ec_client_with(*, upload, ads):
+    return _FakeClient({
+        "ConversionUploadService": upload,
+        "GoogleAdsService": ads,
+    })
+
+
+class TestApplyUploadEcForLeads:
+    def _make_changes(self, tmp_path):
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaa,bbb,ccc,ddd,My Job,2026-03-01T12:00:00Z,500.00,USD\n"
+            "eee,fff,ggg,hhh,My Job,2026-03-02T12:00:00Z,1500.00,USD\n"
+        )
+        return {"csv_path": str(p), "partial_failure": True}
+
+    def test_full_success_with_user_identifiers(self, tmp_path):
+        upload = _FakeClickUploadService(results_count=2)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Job", "customers/1/conversionActions/999",
+                type_name="UPLOAD_CLICKS",
+            )
+        ])
+        client = _ec_client_with(upload=upload, ads=ads)
+
+        result = conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._make_changes(tmp_path)
+        )
+
+        assert result["uploaded_total"] == 2
+        assert result["success_count"] == 2
+        assert result["failure_count"] == 0
+        sent = upload.called_with["conversions"]
+        assert len(sent) == 2
+        # Each row should have multiple user_identifiers (email, phone, name)
+        assert len(sent[0].user_identifiers) == 3
+        assert sent[0].user_identifiers[0].hashed_email == "aaa"
+        assert sent[0].user_identifiers[1].hashed_phone_number == "bbb"
+        assert sent[0].user_identifiers[2].address_info.hashed_first_name == "ccc"
+        assert sent[0].conversion_action == "customers/1/conversionActions/999"
+        assert sent[0].conversion_date_time == "2026-03-01 12:00:00+00:00"
+        assert sent[0].conversion_value == 500.0
+
+    def test_wrong_type_rejected(self, tmp_path):
+        upload = _FakeClickUploadService()
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Job", "customers/1/conversionActions/999",
+                type_name="UPLOAD_CALLS",  # Wrong — needs UPLOAD_CLICKS
+            )
+        ])
+        client = _ec_client_with(upload=upload, ads=ads)
+
+        with pytest.raises(ValueError) as exc:
+            conversion_actions._apply_upload_enhanced_conversions_for_leads(
+                client, "1", self._make_changes(tmp_path)
+            )
+        assert "UPLOAD_CLICKS" in str(exc.value)

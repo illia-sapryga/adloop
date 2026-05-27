@@ -501,3 +501,567 @@ def _apply_remove_conversion_action(client: object, cid: str, changes: dict) -> 
         customer_id=cid, operations=[op]
     )
     return {"resource_name": response.results[0].resource_name}
+
+
+# ---------------------------------------------------------------------------
+# Call-conversion CSV upload — ConversionUploadService.UploadCallConversions
+# ---------------------------------------------------------------------------
+
+_EXPECTED_CALL_HEADERS = [
+    "Caller's Phone Number",
+    "Call Start Time",
+    "Conversion Name",
+    "Conversion Time",
+    "Conversion Value",
+    "Conversion Currency",
+]
+
+
+def _normalize_call_timestamp(ts: str) -> str:
+    """Google Ads API wants 'yyyy-mm-dd HH:MM:SS+|-HH:MM'.
+
+    Our CSV writes ISO 8601 with 'T' separator and trailing 'Z'
+    (e.g. '2026-02-26T16:49:44.567Z'). Convert: strip fractional
+    seconds, replace 'T' with space, replace 'Z' with '+00:00'.
+    """
+    s = (ts or "").strip()
+    if not s:
+        return s
+    # Drop fractional seconds if present
+    if "." in s:
+        head, tail = s.split(".", 1)
+        tz = ""
+        for marker in ("+", "-", "Z"):
+            idx = tail.find(marker)
+            if idx >= 0:
+                tz = tail[idx:]
+                break
+        s = head + (tz or "")
+    s = s.replace("T", " ")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return s
+
+
+def _parse_call_conversion_csv(csv_path: str) -> tuple[list[dict], list[str]]:
+    """Read the AdLoop-generated phone-conversions CSV.
+
+    Returns (rows, errors). Rows are dicts keyed by canonical column name.
+    Skips the optional `Parameters:TimeZone=...` row at the top.
+    """
+    import csv
+    from pathlib import Path
+
+    errors: list[str] = []
+    path = Path(csv_path).expanduser()
+    if not path.exists():
+        return [], [f"CSV not found at {path}"]
+
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        rows_iter = iter(reader)
+        # First non-Parameters row is the header
+        header: list[str] | None = None
+        for raw in rows_iter:
+            if not raw:
+                continue
+            first = (raw[0] or "").strip()
+            if first.startswith("Parameters:") or first.startswith("#") or first.startswith("###"):
+                continue
+            header = [c.strip() for c in raw]
+            break
+        if header is None:
+            return [], ["CSV is empty (no header row found)"]
+
+        missing = [c for c in _EXPECTED_CALL_HEADERS if c not in header]
+        if missing:
+            errors.append(
+                f"CSV missing required columns: {missing}. Got: {header}"
+            )
+            return [], errors
+
+        col = {name: header.index(name) for name in _EXPECTED_CALL_HEADERS}
+        out: list[dict] = []
+        for line_num, raw in enumerate(rows_iter, start=2):
+            if not raw or all((c or "").strip() == "" for c in raw):
+                continue
+            if (raw[0] or "").strip().startswith(("#", "Parameters:")):
+                continue
+            try:
+                value_str = raw[col["Conversion Value"]].strip()
+                value = float(value_str) if value_str else 0.0
+            except (ValueError, IndexError):
+                errors.append(f"Row {line_num}: invalid Conversion Value")
+                continue
+            out.append({
+                "caller_id": raw[col["Caller's Phone Number"]].strip(),
+                "call_start_time": _normalize_call_timestamp(
+                    raw[col["Call Start Time"]]
+                ),
+                "conversion_name": raw[col["Conversion Name"]].strip(),
+                "conversion_time": _normalize_call_timestamp(
+                    raw[col["Conversion Time"]]
+                ),
+                "conversion_value": value,
+                "currency_code": (
+                    raw[col["Conversion Currency"]].strip().upper() or "USD"
+                ),
+            })
+        return out, errors
+
+
+def draft_upload_call_conversions(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    csv_path: str,
+    partial_failure: bool = True,
+) -> dict:
+    """Draft an upload of call conversions from CSV — returns a PREVIEW.
+
+    Reads any CSV matching Google Ads' call-upload schema and previews
+    what would be sent to ConversionUploadService.UploadCallConversions.
+
+    The CSV must have columns: Caller's Phone Number, Call Start Time,
+    Conversion Name, Conversion Time, Conversion Value, Conversion Currency.
+    An optional `Parameters:TimeZone=...` row at the top is ignored.
+
+    The `Conversion Name` value MUST exactly match an existing
+    conversion action whose type is UPLOAD_CALLS.
+
+    partial_failure (default True) lets Google accept the rows that
+    parse successfully and report only the bad ones — recommended.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("upload_call_conversions", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    rows, parse_errors = _parse_call_conversion_csv(csv_path)
+    if parse_errors and not rows:
+        return {"error": "CSV parse failed", "details": parse_errors}
+
+    if not rows:
+        return {"error": "CSV contained zero conversion rows"}
+
+    distinct_actions = sorted({r["conversion_name"] for r in rows})
+    total_value = sum(r["conversion_value"] for r in rows)
+    sample = rows[:3]
+
+    plan = ChangePlan(
+        operation="upload_call_conversions",
+        entity_type="call_conversion_batch",
+        entity_id=str(len(rows)),
+        customer_id=customer_id,
+        changes={
+            "csv_path": str(csv_path),
+            "row_count": len(rows),
+            "total_value": round(total_value, 2),
+            "currency_hint": rows[0]["currency_code"] if rows else "USD",
+            "distinct_conversion_actions": distinct_actions,
+            "partial_failure": bool(partial_failure),
+            "parse_warnings": parse_errors,
+            "sample_rows": [
+                {
+                    "caller_id": r["caller_id"],
+                    "call_start_time": r["call_start_time"],
+                    "conversion_name": r["conversion_name"],
+                    "conversion_value": r["conversion_value"],
+                }
+                for r in sample
+            ],
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+def _resolve_conversion_action_ids(
+    client: object, cid: str, names: list[str]
+) -> dict[str, str]:
+    """Look up conversion_action.resource_name for a list of names.
+
+    Raises ValueError if any name isn't found OR isn't of type UPLOAD_CALLS.
+    """
+    if not names:
+        return {}
+
+    ga_service = client.get_service("GoogleAdsService")
+    quoted = ", ".join(f"'{n.replace(chr(39), chr(39) + chr(39))}'" for n in names)
+    query = (
+        "SELECT conversion_action.id, conversion_action.name, "
+        "conversion_action.resource_name, conversion_action.type, "
+        "conversion_action.status "
+        "FROM conversion_action "
+        f"WHERE conversion_action.name IN ({quoted}) "
+        "AND conversion_action.status != 'REMOVED'"
+    )
+    response = ga_service.search(customer_id=cid, query=query)
+
+    mapping: dict[str, str] = {}
+    bad_types: list[str] = []
+    for row in response:
+        ca = row.conversion_action
+        ca_type = ca.type_.name if hasattr(ca.type_, "name") else str(ca.type_)
+        if ca_type != "UPLOAD_CALLS":
+            bad_types.append(f"{ca.name} (type={ca_type})")
+            continue
+        mapping[ca.name] = ca.resource_name
+
+    missing = [n for n in names if n not in mapping]
+    if bad_types:
+        raise ValueError(
+            "Some conversion actions exist but are not of type UPLOAD_CALLS "
+            f"(needed for call uploads): {bad_types}. "
+            "Create a new conversion action via "
+            "draft_create_conversion_action(type_='UPLOAD_CALLS', ...) "
+            "or via Google Ads UI: Tools → Conversions → New → "
+            "Import → Other data sources → Track conversions from calls."
+        )
+    if missing:
+        raise ValueError(
+            f"Conversion action(s) not found: {missing}. "
+            "Verify the 'Conversion Name' column in the CSV matches exactly."
+        )
+    return mapping
+
+
+def _apply_upload_call_conversions(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Execute the call-conversion upload via ConversionUploadService.
+
+    Returns counts of successes / failures plus per-row error details.
+    """
+    rows, parse_errors = _parse_call_conversion_csv(changes["csv_path"])
+    if not rows:
+        return {
+            "error": "CSV produced zero parseable rows at apply time",
+            "parse_errors": parse_errors,
+        }
+
+    distinct = sorted({r["conversion_name"] for r in rows})
+    action_resources = _resolve_conversion_action_ids(client, cid, distinct)
+
+    conversion_type = client.get_type("CallConversion")
+    payload: list = []
+    for r in rows:
+        cc = conversion_type.__class__()
+        cc.caller_id = r["caller_id"]
+        cc.call_start_date_time = r["call_start_time"]
+        cc.conversion_action = action_resources[r["conversion_name"]]
+        cc.conversion_date_time = r["conversion_time"]
+        cc.conversion_value = float(r["conversion_value"])
+        cc.currency_code = r["currency_code"]
+        payload.append(cc)
+
+    upload_service = client.get_service("ConversionUploadService")
+    response = upload_service.upload_call_conversions(
+        customer_id=cid,
+        conversions=payload,
+        partial_failure=bool(changes.get("partial_failure", True)),
+    )
+
+    results = list(response.results)
+    success_count = sum(1 for r in results if r.caller_id)
+    failure_count = len(results) - success_count
+
+    row_errors: list[dict] = []
+    partial = getattr(response, "partial_failure_error", None)
+    if partial and partial.message:
+        row_errors.append({
+            "type": "partial_failure",
+            "message": partial.message,
+            "code": getattr(partial, "code", None),
+        })
+
+    return {
+        "uploaded_total": len(payload),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "conversion_actions_used": action_resources,
+        "row_errors": row_errors,
+        "parse_warnings": parse_errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Enhanced Conversions for Leads — UploadClickConversions w/ user_identifiers
+# ---------------------------------------------------------------------------
+
+_EXPECTED_EC_HEADERS = [
+    "Email",
+    "Phone Number",
+    "First Name",
+    "Last Name",
+    "Conversion Name",
+    "Conversion Time",
+    "Conversion Value",
+    "Conversion Currency",
+]
+
+
+def _parse_ec_for_leads_csv(csv_path: str) -> tuple[list[dict], list[str]]:
+    """Parse the AdLoop EC-for-Leads CSV (already SHA-256 hashed PII)."""
+    import csv
+    from pathlib import Path
+
+    errors: list[str] = []
+    path = Path(csv_path).expanduser()
+    if not path.exists():
+        return [], [f"CSV not found at {path}"]
+
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        rows_iter = iter(reader)
+        header: list[str] | None = None
+        for raw in rows_iter:
+            if not raw:
+                continue
+            first = (raw[0] or "").strip()
+            if first.startswith("Parameters:") or first.startswith("#"):
+                continue
+            header = [c.strip() for c in raw]
+            break
+        if header is None:
+            return [], ["CSV is empty"]
+
+        missing = [c for c in _EXPECTED_EC_HEADERS if c not in header]
+        if missing:
+            return [], [
+                f"CSV missing required columns: {missing}. Got: {header}"
+            ]
+        col = {n: header.index(n) for n in _EXPECTED_EC_HEADERS}
+        out: list[dict] = []
+        for line_num, raw in enumerate(rows_iter, start=2):
+            if not raw or all((c or "").strip() == "" for c in raw):
+                continue
+            try:
+                value_str = raw[col["Conversion Value"]].strip()
+                value = float(value_str) if value_str else 0.0
+            except (ValueError, IndexError):
+                errors.append(f"Row {line_num}: invalid Conversion Value")
+                continue
+            out.append({
+                "email_sha256": raw[col["Email"]].strip(),
+                "phone_sha256": raw[col["Phone Number"]].strip(),
+                "first_name_sha256": raw[col["First Name"]].strip(),
+                "last_name_sha256": raw[col["Last Name"]].strip(),
+                "conversion_name": raw[col["Conversion Name"]].strip(),
+                "conversion_time": _normalize_call_timestamp(
+                    raw[col["Conversion Time"]]
+                ),
+                "conversion_value": value,
+                "currency_code": (
+                    raw[col["Conversion Currency"]].strip().upper() or "USD"
+                ),
+            })
+        return out, errors
+
+
+def draft_upload_enhanced_conversions_for_leads(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    csv_path: str,
+    partial_failure: bool = True,
+) -> dict:
+    """Draft an Enhanced Conversions for Leads upload — returns PREVIEW.
+
+    Reads any SHA-256-hashed PII CSV matching Google Ads' EC for Leads
+    schema and previews what will be pushed via
+    ConversionUploadService.UploadClickConversions with user_identifiers
+    populated.
+
+    The target conversion action must be of type UPLOAD_CLICKS (EC for
+    Leads layers user-identifier matching on top of click conversions).
+    Works retroactively — no "action must be created before call" constraint
+    like UPLOAD_CALLS has.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation(
+            "upload_enhanced_conversions_for_leads", config.safety
+        )
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    rows, parse_errors = _parse_ec_for_leads_csv(csv_path)
+    if parse_errors and not rows:
+        return {"error": "CSV parse failed", "details": parse_errors}
+    if not rows:
+        return {"error": "CSV contained zero conversion rows"}
+
+    distinct_actions = sorted({r["conversion_name"] for r in rows})
+    total_value = sum(r["conversion_value"] for r in rows)
+    with_email = sum(1 for r in rows if r["email_sha256"])
+    with_phone = sum(1 for r in rows if r["phone_sha256"])
+    sample = rows[:3]
+
+    plan = ChangePlan(
+        operation="upload_enhanced_conversions_for_leads",
+        entity_type="ec_for_leads_batch",
+        entity_id=str(len(rows)),
+        customer_id=customer_id,
+        changes={
+            "csv_path": str(csv_path),
+            "row_count": len(rows),
+            "total_value": round(total_value, 2),
+            "currency_hint": rows[0]["currency_code"] if rows else "USD",
+            "rows_with_email": with_email,
+            "rows_with_phone": with_phone,
+            "distinct_conversion_actions": distinct_actions,
+            "partial_failure": bool(partial_failure),
+            "parse_warnings": parse_errors,
+            "sample_rows": [
+                {
+                    "email_sha256": r["email_sha256"][:16] + "..."
+                    if r["email_sha256"] else "",
+                    "phone_sha256": r["phone_sha256"][:16] + "..."
+                    if r["phone_sha256"] else "",
+                    "conversion_name": r["conversion_name"],
+                    "conversion_value": r["conversion_value"],
+                    "conversion_time": r["conversion_time"],
+                }
+                for r in sample
+            ],
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+def _resolve_upload_clicks_action(
+    client: object, cid: str, names: list[str]
+) -> dict[str, str]:
+    """Look up conversion_action.resource_name for UPLOAD_CLICKS actions."""
+    if not names:
+        return {}
+
+    ga_service = client.get_service("GoogleAdsService")
+    quoted = ", ".join(
+        f"'{n.replace(chr(39), chr(39) + chr(39))}'" for n in names
+    )
+    query = (
+        "SELECT conversion_action.id, conversion_action.name, "
+        "conversion_action.resource_name, conversion_action.type, "
+        "conversion_action.status "
+        "FROM conversion_action "
+        f"WHERE conversion_action.name IN ({quoted}) "
+        "AND conversion_action.status != 'REMOVED'"
+    )
+    response = ga_service.search(customer_id=cid, query=query)
+
+    mapping: dict[str, str] = {}
+    wrong_type: list[str] = []
+    for row in response:
+        ca = row.conversion_action
+        ca_type = ca.type_.name if hasattr(ca.type_, "name") else str(ca.type_)
+        if ca_type != "UPLOAD_CLICKS":
+            wrong_type.append(f"{ca.name} (type={ca_type})")
+            continue
+        mapping[ca.name] = ca.resource_name
+
+    missing = [n for n in names if n not in mapping]
+    if wrong_type:
+        raise ValueError(
+            "Some conversion actions are not of type UPLOAD_CLICKS "
+            "(required for Enhanced Conversions for Leads uploads): "
+            f"{wrong_type}. Use an UPLOAD_CLICKS-type action — create one "
+            "via draft_create_conversion_action(type_='UPLOAD_CLICKS', ...)."
+        )
+    if missing:
+        raise ValueError(
+            f"Conversion action(s) not found: {missing}. "
+            "Verify the 'Conversion Name' column in the CSV."
+        )
+    return mapping
+
+
+def _apply_upload_enhanced_conversions_for_leads(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Execute EC-for-Leads upload via ConversionUploadService."""
+    rows, parse_errors = _parse_ec_for_leads_csv(changes["csv_path"])
+    if not rows:
+        return {
+            "error": "CSV produced zero parseable rows at apply time",
+            "parse_errors": parse_errors,
+        }
+
+    distinct = sorted({r["conversion_name"] for r in rows})
+    action_resources = _resolve_upload_clicks_action(client, cid, distinct)
+
+    click_conv_type = client.get_type("ClickConversion")
+    user_id_type = client.get_type("UserIdentifier")
+    payload: list = []
+
+    for r in rows:
+        cc = click_conv_type.__class__()
+        cc.conversion_action = action_resources[r["conversion_name"]]
+        cc.conversion_date_time = r["conversion_time"]
+        cc.conversion_value = float(r["conversion_value"])
+        cc.currency_code = r["currency_code"]
+
+        # Build user_identifiers — Google matches the hashed email/phone
+        # to logged-in Google users who clicked our ads.
+        if r["email_sha256"]:
+            uid = user_id_type.__class__()
+            uid.hashed_email = r["email_sha256"]
+            cc.user_identifiers.append(uid)
+        if r["phone_sha256"]:
+            uid = user_id_type.__class__()
+            uid.hashed_phone_number = r["phone_sha256"]
+            cc.user_identifiers.append(uid)
+        # First+Last together as address_info (improves match rate)
+        if r["first_name_sha256"] and r["last_name_sha256"]:
+            uid = user_id_type.__class__()
+            uid.address_info.hashed_first_name = r["first_name_sha256"]
+            uid.address_info.hashed_last_name = r["last_name_sha256"]
+            cc.user_identifiers.append(uid)
+
+        if not cc.user_identifiers:
+            continue
+        payload.append(cc)
+
+    upload_service = client.get_service("ConversionUploadService")
+    response = upload_service.upload_click_conversions(
+        customer_id=cid,
+        conversions=payload,
+        partial_failure=bool(changes.get("partial_failure", True)),
+    )
+
+    results = list(response.results)
+    success_count = sum(
+        1 for r in results
+        if getattr(r, "conversion_action", "") or getattr(r, "gclid", "")
+        or getattr(r, "user_identifiers", None)
+    )
+    failure_count = len(results) - success_count
+
+    row_errors: list[dict] = []
+    partial = getattr(response, "partial_failure_error", None)
+    if partial and partial.message:
+        row_errors.append({
+            "type": "partial_failure",
+            "message": partial.message,
+            "code": getattr(partial, "code", None),
+        })
+
+    return {
+        "uploaded_total": len(payload),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "conversion_actions_used": action_resources,
+        "row_errors": row_errors,
+        "parse_warnings": parse_errors,
+    }

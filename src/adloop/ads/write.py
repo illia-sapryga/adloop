@@ -3207,6 +3207,9 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_conversion_action": _apply_create_conversion_action_route,
         "update_conversion_action": _apply_update_conversion_action_route,
         "remove_conversion_action": _apply_remove_conversion_action_route,
+        "upload_call_conversions": _apply_upload_call_conversions_route,
+        "upload_enhanced_conversions_for_leads":
+            _apply_upload_enhanced_conversions_for_leads_route,
         "add_ad_schedule": _apply_add_ad_schedule,
         "add_geo_exclusions": _apply_add_geo_exclusions,
     }
@@ -4767,6 +4770,18 @@ def _apply_update_conversion_action_route(client, cid, changes):
 def _apply_remove_conversion_action_route(client, cid, changes):
     from adloop.ads.conversion_actions import _apply_remove_conversion_action
     return _apply_remove_conversion_action(client, cid, changes)
+
+
+def _apply_upload_call_conversions_route(client, cid, changes):
+    from adloop.ads.conversion_actions import _apply_upload_call_conversions
+    return _apply_upload_call_conversions(client, cid, changes)
+
+
+def _apply_upload_enhanced_conversions_for_leads_route(client, cid, changes):
+    from adloop.ads.conversion_actions import (
+        _apply_upload_enhanced_conversions_for_leads,
+    )
+    return _apply_upload_enhanced_conversions_for_leads(client, cid, changes)
 
 
 def _apply_update_call_asset(client: object, cid: str, changes: dict) -> dict:
