@@ -815,9 +815,22 @@ _EXPECTED_EC_HEADERS = [
     "Conversion Currency",
 ]
 
+# Optional CSV columns — parsed when present, omitted otherwise. Order ID
+# is Google's dedup key for ClickConversion uploads: if set, re-uploading
+# the same Order ID is idempotent; if absent, re-uploads double-count.
+_OPTIONAL_EC_HEADERS = [
+    "Order ID",
+]
+
 
 def _parse_ec_for_leads_csv(csv_path: str) -> tuple[list[dict], list[str]]:
-    """Parse the AdLoop EC-for-Leads CSV (already SHA-256 hashed PII)."""
+    """Parse the AdLoop EC-for-Leads CSV (already SHA-256 hashed PII).
+
+    Required columns: Email, Phone Number, First Name, Last Name,
+    Conversion Name, Conversion Time, Conversion Value, Conversion Currency.
+    Optional: Order ID (Google's dedup key — strongly recommended so
+    re-uploads of the same source row don't double-count).
+    """
     import csv
     from pathlib import Path
 
@@ -847,6 +860,9 @@ def _parse_ec_for_leads_csv(csv_path: str) -> tuple[list[dict], list[str]]:
                 f"CSV missing required columns: {missing}. Got: {header}"
             ]
         col = {n: header.index(n) for n in _EXPECTED_EC_HEADERS}
+        optional_col = {
+            n: header.index(n) for n in _OPTIONAL_EC_HEADERS if n in header
+        }
         out: list[dict] = []
         for line_num, raw in enumerate(rows_iter, start=2):
             if not raw or all((c or "").strip() == "" for c in raw):
@@ -857,6 +873,12 @@ def _parse_ec_for_leads_csv(csv_path: str) -> tuple[list[dict], list[str]]:
             except (ValueError, IndexError):
                 errors.append(f"Row {line_num}: invalid Conversion Value")
                 continue
+            order_id = ""
+            if "Order ID" in optional_col:
+                try:
+                    order_id = raw[optional_col["Order ID"]].strip()
+                except IndexError:
+                    pass
             out.append({
                 "email_sha256": raw[col["Email"]].strip(),
                 "phone_sha256": raw[col["Phone Number"]].strip(),
@@ -870,6 +892,7 @@ def _parse_ec_for_leads_csv(csv_path: str) -> tuple[list[dict], list[str]]:
                 "currency_code": (
                     raw[col["Conversion Currency"]].strip().upper() or "USD"
                 ),
+                "order_id": order_id,
             })
         return out, errors
 
@@ -915,7 +938,22 @@ def draft_upload_enhanced_conversions_for_leads(
     total_value = sum(r["conversion_value"] for r in rows)
     with_email = sum(1 for r in rows if r["email_sha256"])
     with_phone = sum(1 for r in rows if r["phone_sha256"])
+    with_order_id = sum(1 for r in rows if r.get("order_id"))
     sample = rows[:3]
+
+    dedup_warnings: list[str] = []
+    if with_order_id == 0:
+        dedup_warnings.append(
+            "No Order ID column present. Re-uploading this CSV will "
+            "double-count any matched conversions because Google has no "
+            "dedup key. Add an Order ID column (e.g. a stable source row "
+            "identifier) so re-uploads are idempotent."
+        )
+    elif with_order_id < len(rows):
+        dedup_warnings.append(
+            f"Only {with_order_id} of {len(rows)} rows have an Order ID. "
+            "Rows without one will double-count on re-upload."
+        )
 
     plan = ChangePlan(
         operation="upload_enhanced_conversions_for_leads",
@@ -929,9 +967,11 @@ def draft_upload_enhanced_conversions_for_leads(
             "currency_hint": rows[0]["currency_code"] if rows else "USD",
             "rows_with_email": with_email,
             "rows_with_phone": with_phone,
+            "rows_with_order_id": with_order_id,
             "distinct_conversion_actions": distinct_actions,
             "partial_failure": bool(partial_failure),
             "parse_warnings": parse_errors,
+            "dedup_warnings": dedup_warnings,
             "sample_rows": [
                 {
                     "email_sha256": r["email_sha256"][:16] + "..."
@@ -941,6 +981,7 @@ def draft_upload_enhanced_conversions_for_leads(
                     "conversion_name": r["conversion_name"],
                     "conversion_value": r["conversion_value"],
                     "conversion_time": r["conversion_time"],
+                    "order_id": r.get("order_id", ""),
                 }
                 for r in sample
             ],
@@ -1022,6 +1063,12 @@ def _apply_upload_enhanced_conversions_for_leads(
         cc.conversion_value = float(r["conversion_value"])
         cc.currency_code = r["currency_code"]
 
+        # Order ID is Google's dedup key for ClickConversion. When set,
+        # re-uploading the same (conversion_action, order_id) pair is a
+        # no-op; without it, every upload event counts as a fresh conversion.
+        if r.get("order_id"):
+            cc.order_id = r["order_id"]
+
         # Build user_identifiers — Google matches the hashed email/phone
         # to logged-in Google users who clicked our ads.
         if r["email_sha256"]:
@@ -1051,10 +1098,14 @@ def _apply_upload_enhanced_conversions_for_leads(
     )
 
     results = list(response.results)
+    # The Google Ads API only populates the result row's ``conversion_action``
+    # field for rows that actually matched and were accepted. Failed rows
+    # come back with empty conversion_action (and a corresponding entry in
+    # partial_failure_error). Previously we treated echoed user_identifiers
+    # as a success signal — but the API echoes them back for failed rows
+    # too, which silently overcounted success.
     success_count = sum(
-        1 for r in results
-        if getattr(r, "conversion_action", "") or getattr(r, "gclid", "")
-        or getattr(r, "user_identifiers", None)
+        1 for r in results if getattr(r, "conversion_action", "")
     )
     failure_count = len(results) - success_count
 

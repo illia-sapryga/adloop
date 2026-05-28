@@ -1032,3 +1032,237 @@ class TestApplyUploadEcForLeads:
                 client, "1", self._make_changes(tmp_path)
             )
         assert "UPLOAD_CLICKS" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Order ID — dedup-key support added so re-uploads are idempotent.
+# Google's ClickConversion dedup is keyed on (conversion_action, order_id);
+# without an order_id, every upload counts as a fresh conversion event.
+# ---------------------------------------------------------------------------
+
+
+class TestOrderIdParsing:
+    def _write(self, tmp_path, content):
+        p = tmp_path / "ec.csv"
+        p.write_text(content)
+        return str(p)
+
+    def test_parser_reads_order_id_when_present(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,Order ID\n"
+            "aaaa,bbbb,cccc,dddd,My Action,"
+            "2026-03-01T12:00:00Z,250.00,USD,job-12345\n",
+        )
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(path)
+        assert errors == []
+        assert rows[0]["order_id"] == "job-12345"
+
+    def test_parser_defaults_order_id_to_empty_when_column_absent(
+        self, tmp_path
+    ):
+        # Backwards compat: existing CSVs without Order ID still parse fine.
+        path = self._write(
+            tmp_path,
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaaa,bbbb,cccc,dddd,My Action,2026-03-01T12:00:00Z,250.00,USD\n",
+        )
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(path)
+        assert errors == []
+        assert rows[0]["order_id"] == ""
+
+    def test_parser_handles_missing_order_id_value_in_row(self, tmp_path):
+        # Order ID column declared but specific row leaves it blank — parse
+        # should accept the row and treat order_id as empty.
+        path = self._write(
+            tmp_path,
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,Order ID\n"
+            "aaaa,bbbb,cccc,dddd,My Action,"
+            "2026-03-01T12:00:00Z,250.00,USD,\n"
+            "eeee,ffff,gggg,hhhh,My Action,"
+            "2026-03-02T12:00:00Z,300.00,USD,job-42\n",
+        )
+        rows, errors = conversion_actions._parse_ec_for_leads_csv(path)
+        assert errors == []
+        assert rows[0]["order_id"] == ""
+        assert rows[1]["order_id"] == "job-42"
+
+
+class TestDraftSurfacesOrderIdStats:
+    def _write(self, tmp_path, *, with_order_id: bool):
+        header = (
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency"
+        )
+        rows = [
+            "aaa,bbb,ccc,ddd,Job Close,2026-03-01T12:00:00Z,500.00,USD",
+            "eee,fff,ggg,hhh,Job Close,2026-03-02T12:00:00Z,1500.00,USD",
+        ]
+        if with_order_id:
+            header += ",Order ID"
+            rows = [f"{r},job-{i}" for i, r in enumerate(rows, start=1)]
+        p = tmp_path / "ec.csv"
+        p.write_text(header + "\n" + "\n".join(rows) + "\n")
+        return str(p)
+
+    def test_preview_includes_rows_with_order_id_count(self, config, tmp_path):
+        path = self._write(tmp_path, with_order_id=True)
+        result = conversion_actions.draft_upload_enhanced_conversions_for_leads(
+            config, customer_id="1234567890", csv_path=path,
+        )
+        c = result["changes"]
+        assert c["rows_with_order_id"] == 2
+
+    def test_preview_warns_when_no_order_id_present(self, config, tmp_path):
+        path = self._write(tmp_path, with_order_id=False)
+        result = conversion_actions.draft_upload_enhanced_conversions_for_leads(
+            config, customer_id="1234567890", csv_path=path,
+        )
+        c = result["changes"]
+        assert c["rows_with_order_id"] == 0
+        warnings = c["dedup_warnings"]
+        assert len(warnings) == 1
+        assert "double-count" in warnings[0]
+
+    def test_preview_warns_on_partial_order_id_coverage(
+        self, config, tmp_path
+    ):
+        # 1 of 2 rows has an Order ID — the other will double-count.
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,Order ID\n"
+            "aaa,bbb,ccc,ddd,Job Close,2026-03-01T12:00:00Z,500.00,USD,job-1\n"
+            "eee,fff,ggg,hhh,Job Close,2026-03-02T12:00:00Z,1500.00,USD,\n"
+        )
+        result = conversion_actions.draft_upload_enhanced_conversions_for_leads(
+            config, customer_id="1234567890", csv_path=str(p),
+        )
+        c = result["changes"]
+        assert c["rows_with_order_id"] == 1
+        assert any("1 of 2" in w for w in c["dedup_warnings"])
+
+    def test_sample_rows_include_order_id_field(self, config, tmp_path):
+        path = self._write(tmp_path, with_order_id=True)
+        result = conversion_actions.draft_upload_enhanced_conversions_for_leads(
+            config, customer_id="1234567890", csv_path=path,
+        )
+        sample = result["changes"]["sample_rows"][0]
+        assert sample["order_id"] == "job-1"
+
+
+class TestApplySetsOrderIdOnProto:
+    def _changes_with_order_ids(self, tmp_path):
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency,Order ID\n"
+            "aaa,bbb,ccc,ddd,My Job,2026-03-01T12:00:00Z,500.00,USD,job-1\n"
+            "eee,fff,ggg,hhh,My Job,2026-03-02T12:00:00Z,1500.00,USD,job-2\n"
+        )
+        return {"csv_path": str(p), "partial_failure": True}
+
+    def _changes_without_order_ids(self, tmp_path):
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaa,bbb,ccc,ddd,My Job,2026-03-01T12:00:00Z,500.00,USD\n"
+        )
+        return {"csv_path": str(p), "partial_failure": True}
+
+    def test_order_id_propagated_to_click_conversion(self, tmp_path):
+        upload = _FakeClickUploadService(results_count=2)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Job", "customers/1/conversionActions/999",
+                type_name="UPLOAD_CLICKS",
+            )
+        ])
+        client = _ec_client_with(upload=upload, ads=ads)
+
+        conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._changes_with_order_ids(tmp_path)
+        )
+
+        sent = upload.called_with["conversions"]
+        assert sent[0].order_id == "job-1"
+        assert sent[1].order_id == "job-2"
+
+    def test_order_id_left_unset_when_row_lacks_it(self, tmp_path):
+        upload = _FakeClickUploadService(results_count=1)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Job", "customers/1/conversionActions/999",
+                type_name="UPLOAD_CLICKS",
+            )
+        ])
+        client = _ec_client_with(upload=upload, ads=ads)
+
+        conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._changes_without_order_ids(tmp_path)
+        )
+
+        sent = upload.called_with["conversions"]
+        # proto default for unset string is "" — assert we did not populate it
+        assert sent[0].order_id == ""
+
+
+class TestApplySuccessCountIsRealistic:
+    """The previous implementation treated echoed user_identifiers as a
+    success signal, which silently overcounted because the API echoes them
+    back even for rows that failed to match. We now key success off the
+    response row's conversion_action being populated.
+    """
+
+    def _changes(self, tmp_path):
+        p = tmp_path / "ec.csv"
+        p.write_text(
+            "Email,Phone Number,First Name,Last Name,Conversion Name,"
+            "Conversion Time,Conversion Value,Conversion Currency\n"
+            "aaa,bbb,ccc,ddd,My Job,2026-03-01T12:00:00Z,500.00,USD\n"
+            "eee,fff,ggg,hhh,My Job,2026-03-02T12:00:00Z,1500.00,USD\n"
+            "iii,jjj,kkk,lll,My Job,2026-03-03T12:00:00Z,250.00,USD\n"
+        )
+        return {"csv_path": str(p), "partial_failure": True}
+
+    def _client(self, results_count: int):
+        upload = _FakeClickUploadService(results_count=results_count)
+        ads = _FakeGoogleAdsService([
+            _FakeSearchRow(
+                "My Job", "customers/1/conversionActions/999",
+                type_name="UPLOAD_CLICKS",
+            )
+        ])
+        return _ec_client_with(upload=upload, ads=ads)
+
+    def test_zero_matched_reports_zero_success(self, tmp_path):
+        client = self._client(results_count=0)
+        result = conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._changes(tmp_path)
+        )
+        assert result["uploaded_total"] == 3
+        assert result["success_count"] == 0
+        assert result["failure_count"] == 3
+
+    def test_partial_match_reports_partial_counts(self, tmp_path):
+        # 1 of 3 rows matched at the API — the other 2 came back empty.
+        client = self._client(results_count=1)
+        result = conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._changes(tmp_path)
+        )
+        assert result["uploaded_total"] == 3
+        assert result["success_count"] == 1
+        assert result["failure_count"] == 2
+
+    def test_full_match_reports_full_success(self, tmp_path):
+        client = self._client(results_count=3)
+        result = conversion_actions._apply_upload_enhanced_conversions_for_leads(
+            client, "1", self._changes(tmp_path)
+        )
+        assert result["uploaded_total"] == 3
+        assert result["success_count"] == 3
+        assert result["failure_count"] == 0
