@@ -1924,6 +1924,8 @@ def draft_responsive_search_ad(
 def update_responsive_search_ad(
     ad_id: str,
     customer_id: str = "",
+    headlines: list[str | dict] | None = None,
+    descriptions: list[str | dict] | None = None,
     final_url: str = "",
     path1: str = "",
     path2: str = "",
@@ -1934,12 +1936,19 @@ def update_responsive_search_ad(
 
     In-place edit of an RSA without creating a new ad (preserves serving
     history and avoids the learning-period reset that pause-old + create-new
-    triggers). Google Ads API v23 lets you mutate ``final_urls``, ``path1``,
-    and ``path2`` on existing RSAs; ``headlines`` and ``descriptions`` remain
-    immutable — for those you still need draft_responsive_search_ad +
-    pause_entity on the old ad.
+    triggers). Google Ads API v23 via ``AdService.MutateAds`` permits in-place
+    mutation of ``final_urls``, ``path1``, ``path2``, ``headlines``, and
+    ``descriptions`` on existing RSAs.
+
+    Headlines/descriptions are LIST-REPLACE — when provided, the supplied
+    list fully swaps in for the existing one, and Google's RSA constraints
+    apply (3-15 headlines, 2-4 descriptions, 30/90 char limits, pin-slot
+    rules). Each entry may be a plain string (unpinned) or
+    ``{"text": "...", "pinned_field": "HEADLINE_1"}``.
 
     Argument semantics:
+        - ``headlines`` / ``descriptions``: None or [] -> no change;
+          non-empty list -> replaces the existing list in full
         - ``final_url``: empty -> no change; non-empty -> replaces final URL
         - ``path1`` / ``path2``: empty -> no change; non-empty -> sets value
         - ``clear_path1`` / ``clear_path2``: True -> set to empty string
@@ -1953,6 +1962,8 @@ def update_responsive_search_ad(
         _config,
         customer_id=customer_id or _config.ads.customer_id,
         ad_id=ad_id,
+        headlines=headlines,
+        descriptions=descriptions,
         final_url=final_url,
         path1=path1,
         path2=path2,
