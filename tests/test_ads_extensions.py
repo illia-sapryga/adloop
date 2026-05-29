@@ -41,6 +41,7 @@ class _FakeMutateOperationResponse:
         self.asset_result = _FakeResult()
         self.campaign_asset_result = _FakeResult()
         self.customer_asset_result = _FakeResult()
+        self.ad_group_asset_result = _FakeResult()
         self._response_type = response_type
         if response_type:
             getattr(self, response_type).resource_name = resource_name
@@ -88,6 +89,13 @@ class _FakeGoogleAdsService(_FakePathService):
     def search(self, customer_id: str, query: str) -> list[object]:
         self.search_calls.append(query)
         return list(self._search_rows)
+
+    # Override the inherited path helper so the fake mimics the real
+    # GoogleAdsService's resource-name shape per resource type, not just
+    # the constructor prefix ("campaigns"). Production code expects
+    # ad_group_path to return ".../adGroups/{id}".
+    def ad_group_path(self, customer_id: str, entity_id: str) -> str:
+        return f"customers/{customer_id}/adGroups/{entity_id}"
 
 
 class _FakeCampaignCriterionService(_FakePathService):
@@ -520,6 +528,34 @@ class TestDraftCallAsset:
         assert plan.changes["scope"] == "campaign"
         assert plan.changes["campaign_id"] == "42"
 
+    def test_ad_group_scope_when_ad_group_id_provided(self, config):
+        """ad_group_id selects ad_group scope and populates entity correctly."""
+        result = write.draft_call_asset(
+            config,
+            customer_id="1234567890",
+            ad_group_id="199931082447",
+            phone_number="+19164609257",
+            call_conversion_action_id="7627696943",
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.changes["ad_group_id"] == "199931082447"
+        assert plan.entity_type == "ad_group_asset"
+        assert plan.entity_id == "199931082447"
+
+    def test_ad_group_scope_wins_over_campaign_scope(self, config):
+        """When both ad_group_id and campaign_id are passed, the most
+        specific scope (ad_group) wins. Documents the precedence rule."""
+        result = write.draft_call_asset(
+            config,
+            customer_id="1234567890",
+            campaign_id="42",
+            ad_group_id="199931082447",
+            phone_number="+19164609257",
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+
     def test_invalid_ad_schedule_short_circuits(self, config):
         result = write.draft_call_asset(
             config,
@@ -615,6 +651,84 @@ class TestApplyCreateCallAsset:
         link = google_ads.operations[1].campaign_asset_operation.create
         assert link.field_type == client.enums.AssetFieldTypeEnum.CALL
         assert link.campaign == "customers/1/campaigns/42"
+
+    def test_ad_group_scope_creates_ad_group_asset_link(self):
+        """ad_group scope creates an AdGroupAsset link bound to the right
+        ad group, wired to the per-service conversion action."""
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/199931082447~-1~CALL",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+                "ConversionActionService": _FakePathService("conversionActions"),
+            }
+        )
+
+        result = write._apply_create_call_asset(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "199931082447",
+                "phone_number": "+19164609257",
+                "country_code": "US",
+                "call_conversion_action_id": "7627696943",
+                "ad_schedule": [],
+            },
+        )
+
+        # Asset payload set correctly on the create
+        asset_op = google_ads.operations[0].asset_operation.create
+        assert asset_op.call_asset.phone_number == "+19164609257"
+        assert asset_op.call_asset.call_conversion_action == (
+            "customers/1/conversionActions/7627696943"
+        )
+
+        # Link is an AdGroupAsset (not CampaignAsset, not CustomerAsset)
+        link = google_ads.operations[1].ad_group_asset_operation.create
+        assert link.field_type == client.enums.AssetFieldTypeEnum.CALL
+        assert link.ad_group == "customers/1/adGroups/199931082447"
+
+        # Returned link resource_name surfaces back to the caller
+        assert result["link"] == (
+            "customers/1/adGroupAssets/199931082447~-1~CALL"
+        )
+
+    def test_ad_group_scope_requires_ad_group_id(self):
+        """Apply must fail loudly if scope=ad_group but no ad_group_id was
+        passed through the changes dict (prevents silent misconfiguration)."""
+        google_ads = _FakeGoogleAdsService([])
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+                "ConversionActionService": _FakePathService("conversionActions"),
+            }
+        )
+        with pytest.raises(ValueError, match="ad_group_id required"):
+            write._apply_create_call_asset(
+                client,
+                "1",
+                {
+                    "scope": "ad_group",
+                    "campaign_id": "",
+                    "ad_group_id": "",
+                    "phone_number": "+19164609257",
+                    "country_code": "US",
+                    "call_conversion_action_id": "",
+                    "ad_schedule": [],
+                },
+            )
 
     def test_with_call_conversion_action(self):
         responses = [

@@ -1611,16 +1611,20 @@ def draft_call_asset(
     phone_number: str = "",
     country_code: str = "US",
     campaign_id: str = "",
+    ad_group_id: str = "",
     call_conversion_action_id: str = "",
     ad_schedule: list[dict] | None = None,
 ) -> dict:
     """Draft a call asset (phone extension) — returns a PREVIEW.
 
-    Scope:
-        - If ``campaign_id`` is provided, the call asset attaches to that
-          campaign via ``CampaignAsset``.
-        - If ``campaign_id`` is empty, the call asset attaches at the
-          customer/account level via ``CustomerAsset``.
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, the call asset attaches to that
+          ad group via ``AdGroupAsset``. Use this for per-service call
+          tracking inside a multi-ad-group campaign.
+        - Else if ``campaign_id`` is provided, the call asset attaches to
+          that campaign via ``CampaignAsset``.
+        - Else, the call asset attaches at the customer/account level via
+          ``CustomerAsset``.
 
     phone_number: human or E.164 (e.g. "+19163393676" or "(916) 339-3676").
     country_code: 2-letter ISO country code used to canonicalize a national
@@ -1655,7 +1659,20 @@ def draft_call_asset(
     if schedule_errors:
         return {"error": "Ad schedule validation failed", "details": schedule_errors}
 
-    scope = "campaign" if campaign_id else "customer"
+    # Most-specific scope wins: ad_group > campaign > customer.
+    if ad_group_id:
+        scope = "ad_group"
+        entity_type = "ad_group_asset"
+        entity_id = ad_group_id
+    elif campaign_id:
+        scope = "campaign"
+        entity_type = "campaign_asset"
+        entity_id = campaign_id
+    else:
+        scope = "customer"
+        entity_type = "customer_asset"
+        entity_id = customer_id
+
     warnings = [
         "Google Ads requires phone-number verification before call assets serve. "
         "Complete verification in Ads UI → Tools → Assets → Calls."
@@ -1663,12 +1680,13 @@ def draft_call_asset(
 
     plan = ChangePlan(
         operation="create_call_asset",
-        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
-        entity_id=campaign_id or customer_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
             "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "phone_number": normalized_phone,
             "country_code": country_code.upper(),
             "call_conversion_action_id": call_conversion_action_id,
@@ -4724,7 +4742,18 @@ def _apply_create_call_asset(client: object, cid: str, changes: dict) -> dict:
     operations.append(op)
 
     scope = changes.get("scope", "campaign")
-    if scope == "campaign":
+    if scope == "ad_group":
+        if not changes.get("ad_group_id"):
+            raise ValueError("ad_group_id required for ad_group-scope call asset")
+        link_op = client.get_type("MutateOperation")
+        ag_asset = link_op.ad_group_asset_operation.create
+        ag_asset.asset = asset_service.asset_path(cid, "-1")
+        ag_asset.ad_group = googleads_service.ad_group_path(
+            cid, changes["ad_group_id"]
+        )
+        ag_asset.field_type = client.enums.AssetFieldTypeEnum.CALL
+        operations.append(link_op)
+    elif scope == "campaign":
         if not changes.get("campaign_id"):
             raise ValueError("campaign_id required for campaign-scope call asset")
         link_op = client.get_type("MutateOperation")
@@ -4750,6 +4779,8 @@ def _apply_create_call_asset(client: object, cid: str, changes: dict) -> dict:
     for resp in response.mutate_operation_responses:
         if resp.asset_result.resource_name and not result["asset"]:
             result["asset"] = resp.asset_result.resource_name
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            result["link"] = resp.ad_group_asset_result.resource_name
         elif scope == "campaign" and resp.campaign_asset_result.resource_name:
             result["link"] = resp.campaign_asset_result.resource_name
         elif scope == "customer" and resp.customer_asset_result.resource_name:

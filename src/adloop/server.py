@@ -2406,17 +2406,21 @@ def draft_call_asset(
     phone_number: str,
     country_code: str = "US",
     campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
     call_conversion_action_id: str = "",
     ad_schedule: list[dict] | None = None,
 ) -> dict:
     """Draft a call asset (phone extension) — returns a PREVIEW.
 
-    Scope:
-        - If ``campaign_id`` is empty, the call asset is added at the
-          customer/account level via CustomerAsset.
-        - If ``campaign_id`` is provided, the call asset is scoped to that
-          single campaign via CampaignAsset.
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, attaches to that ad group via
+          AdGroupAsset. Use for per-service call tracking inside a
+          multi-ad-group campaign (one call asset per ad group, each
+          wired to its own service-specific conversion action).
+        - Else if ``campaign_id`` is provided, attaches to that campaign
+          via CampaignAsset.
+        - Else, attaches at the customer/account level via CustomerAsset.
 
     phone_number: human-formatted or E.164 (e.g. "(916) 339-3676" or
         "+19163393676"). Auto-normalized to E.164 using country_code when
@@ -2443,6 +2447,7 @@ def draft_call_asset(
         phone_number=phone_number,
         country_code=country_code,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         call_conversion_action_id=call_conversion_action_id,
         ad_schedule=ad_schedule,
     )
