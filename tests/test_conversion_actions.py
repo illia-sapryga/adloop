@@ -174,6 +174,45 @@ class TestDraftCreateConversionActionValidation:
         plan = preview_store._pending_plans[result["plan_id"]]
         assert plan.changes["phone_call_duration_seconds"] == 90
 
+    def test_default_value_auto_corrects_always_use_default_value(self, config):
+        """Regression: Google's API rejects (INVALID_VALUE) a create where
+        default_value > 0 is paired with always_use_default_value=False.
+        The draft tool must auto-correct to True so callers don't have to
+        remember the flag every time they pass a default_value."""
+        result = conversion_actions.draft_create_conversion_action(
+            config,
+            **self._ok_args(default_value=400, always_use_default_value=False),
+        )
+        assert "error" not in result
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["default_value"] == 400.0
+        assert plan.changes["always_use_default_value"] is True
+
+    def test_zero_default_value_keeps_always_use_default_value_false(
+        self, config
+    ):
+        """The auto-correct must NOT trigger when default_value is 0 —
+        callers may legitimately want to use snippet-provided values."""
+        result = conversion_actions.draft_create_conversion_action(
+            config,
+            **self._ok_args(
+                default_value=0, always_use_default_value=False
+            ),
+        )
+        assert "error" not in result
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["always_use_default_value"] is False
+
+    def test_explicit_always_use_default_value_true_preserved(self, config):
+        """Sanity: explicit True is preserved (no regression for callers
+        who already set it correctly)."""
+        result = conversion_actions.draft_create_conversion_action(
+            config,
+            **self._ok_args(default_value=500, always_use_default_value=True),
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["always_use_default_value"] is True
+
 
 # ---------------------------------------------------------------------------
 # draft_update_conversion_action
@@ -323,6 +362,45 @@ class TestApplyCreateConversionAction:
         assert ca.phone_call_duration_seconds == 90
         assert ca.click_through_lookback_window_days == 30
         assert ca.view_through_lookback_window_days == 1
+
+    def test_does_not_set_include_in_conversions_metric_on_create(self):
+        """Regression: Google's API treats include_in_conversions_metric
+        as IMMUTABLE on create (derived from category). Setting it in the
+        create mutate raises IMMUTABLE_FIELD. The apply function must
+        leave the proto field unset; callers who need to change it must
+        use draft_update_conversion_action after the create succeeds."""
+        ca_svc = _FakeConversionActionService(
+            [_FakeResult("customers/1/conversionActions/100")]
+        )
+        client = _FakeClient({"ConversionActionService": ca_svc})
+
+        conversion_actions._apply_create_conversion_action(
+            client,
+            "1",
+            {
+                "name": "BGI - Tint - Call from Ad",
+                "type": "AD_CALL",
+                "category": "PHONE_CALL_LEAD",
+                "default_value": 400.0,
+                "currency_code": "USD",
+                "always_use_default_value": True,
+                "counting_type": "ONE_PER_CLICK",
+                "phone_call_duration_seconds": 0,
+                "primary_for_goal": False,
+                # Caller passes True (the tool's default), but the apply
+                # function must NOT propagate it into the proto on create.
+                "include_in_conversions_metric": True,
+                "click_through_window_days": 30,
+                "view_through_window_days": 0,
+                "attribution_model": "",
+            },
+        )
+
+        assert len(ca_svc.operations) == 1
+        ca = ca_svc.operations[0].create
+        # The proto3-optional field must not be explicitly set, otherwise
+        # Google rejects the mutate with IMMUTABLE_FIELD.
+        assert not ca._pb.HasField("include_in_conversions_metric")
 
 
 class TestApplyUpdateConversionAction:

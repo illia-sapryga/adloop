@@ -225,6 +225,13 @@ def draft_create_conversion_action(
     if errors:
         return {"error": "Validation failed", "details": errors}
 
+    # Google Ads API rejects (INVALID_VALUE) a create where default_value > 0
+    # is paired with always_use_default_value=False — it reads as "you set a
+    # value but told me not to use it." Auto-correct to True so callers don't
+    # have to remember the flag every time they pass a default_value.
+    if default_value > 0 and not always_use_default_value:
+        always_use_default_value = True
+
     plan = ChangePlan(
         operation="create_conversion_action",
         entity_type="conversion_action",
@@ -411,7 +418,10 @@ def _apply_create_conversion_action(client: object, cid: str, changes: dict) -> 
     ca.value_settings.default_currency_code = changes["currency_code"]
     ca.value_settings.always_use_default_value = changes["always_use_default_value"]
     ca.primary_for_goal = changes["primary_for_goal"]
-    ca.include_in_conversions_metric = changes["include_in_conversions_metric"]
+    # NOTE: include_in_conversions_metric is IMMUTABLE on create — Google
+    # derives it from the conversion category and rejects any value set in
+    # the create mutate (IMMUTABLE_FIELD). To change it, use
+    # draft_update_conversion_action after the create succeeds.
     if changes.get("phone_call_duration_seconds"):
         ca.phone_call_duration_seconds = changes["phone_call_duration_seconds"]
     if changes.get("click_through_window_days"):
