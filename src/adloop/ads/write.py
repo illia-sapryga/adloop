@@ -1282,21 +1282,41 @@ def update_campaign(
     return preview
 
 
+def _asset_scope(
+    ad_group_id: str, campaign_id: str, customer_id: str
+) -> tuple[str, str, str]:
+    """Resolve asset linkage scope using most-specific-wins precedence.
+
+    Returns ``(scope, entity_type, entity_id)`` for ChangePlan. Precedence:
+    ad_group > campaign > customer. CALLOUT, STRUCTURED_SNIPPET, and
+    PROMOTION all support all three linkage levels per the Google Ads API.
+    """
+    if ad_group_id:
+        return "ad_group", "ad_group_asset", ad_group_id
+    if campaign_id:
+        return "campaign", "campaign_asset", campaign_id
+    return "customer", "customer_asset", customer_id
+
+
 def draft_callouts(
     config: AdLoopConfig,
     *,
     customer_id: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     callouts: list[str] | None = None,
 ) -> dict:
     """Draft callout assets — returns a PREVIEW.
 
-    Scope:
-        - If ``campaign_id`` is provided, the callouts are linked at the
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, the callouts link to that ad group
+          via ``AdGroupAsset``. Use this for per-service callouts inside a
+          multi-ad-group campaign so they don't bleed onto sibling ad groups.
+        - Else if ``campaign_id`` is provided, the callouts link at the
           campaign level via ``CampaignAsset``.
-        - If ``campaign_id`` is empty, the callouts are linked at the
-          customer/account level via ``CustomerAsset`` and become available
-          to all eligible campaigns automatically.
+        - Else, the callouts link at the customer/account level via
+          ``CustomerAsset`` and become available to all eligible campaigns
+          automatically.
     """
     from adloop.safety.guards import SafetyViolation, check_blocked_operation
     from adloop.safety.preview import ChangePlan, store_plan
@@ -1310,15 +1330,18 @@ def draft_callouts(
     if errors:
         return {"error": "Validation failed", "details": errors}
 
-    scope = "campaign" if campaign_id else "customer"
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
     plan = ChangePlan(
         operation="create_callouts",
-        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
-        entity_id=campaign_id or customer_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
             "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "callouts": validated_callouts,
         },
     )
@@ -1331,14 +1354,18 @@ def draft_structured_snippets(
     *,
     customer_id: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     snippets: list[dict] | None = None,
 ) -> dict:
     """Draft structured snippet assets — returns a PREVIEW.
 
-    Scope:
-        - If ``campaign_id`` is provided, snippets attach at the campaign level.
-        - If ``campaign_id`` is empty, snippets attach at the customer/account
-          level and apply to all eligible campaigns by default.
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, snippets link to that ad group via
+          ``AdGroupAsset``.
+        - Else if ``campaign_id`` is provided, snippets attach at the campaign
+          level via ``CampaignAsset``.
+        - Else, snippets attach at the customer/account level and apply to all
+          eligible campaigns by default.
     """
     from adloop.safety.guards import SafetyViolation, check_blocked_operation
     from adloop.safety.preview import ChangePlan, store_plan
@@ -1352,15 +1379,18 @@ def draft_structured_snippets(
     if errors:
         return {"error": "Validation failed", "details": errors}
 
-    scope = "campaign" if campaign_id else "customer"
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
     plan = ChangePlan(
         operation="create_structured_snippets",
-        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
-        entity_id=campaign_id or customer_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
             "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "snippets": validated_snippets,
         },
     )
@@ -1844,6 +1874,234 @@ def _is_valid_iso_date(value: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Price assets
+# ---------------------------------------------------------------------------
+
+# Pulled dynamically from the SDK so we don't drift when Google adds new
+# enum members in a future API version (same pattern as promotions).
+_VALID_PRICE_TYPES = _enum_names("PriceExtensionTypeEnum")
+_VALID_PRICE_QUALIFIERS = _enum_names("PriceExtensionPriceQualifierEnum")
+_VALID_PRICE_UNITS = _enum_names("PriceExtensionPriceUnitEnum")
+
+# Google Ads requires between 3 and 8 price offerings per price asset.
+_PRICE_OFFERING_MIN = 3
+_PRICE_OFFERING_MAX = 8
+# Header and description are each capped at 25 characters by Google.
+_PRICE_TEXT_MAX = 25
+
+
+def _validate_price_inputs(
+    *,
+    price_type: str,
+    price_qualifier: str,
+    language_code: str,
+    currency_code: str,
+    offerings: list[dict] | None,
+) -> tuple[dict, list[str]]:
+    """Validate every PriceAsset field. Returns (normalized, errors).
+
+    A price asset needs a type (e.g. SERVICES), an optional FROM/UP_TO/AVERAGE
+    qualifier, and 3-8 price offerings. Each offering needs a header (<=25),
+    a description (<=25), a price amount (> 0), and a reachable final_url.
+    """
+    errors: list[str] = []
+
+    ptype = (price_type or "").strip().upper()
+    if not ptype:
+        errors.append("price_type is required (e.g. SERVICES, BRANDS, EVENTS)")
+    elif ptype not in _VALID_PRICE_TYPES:
+        errors.append(
+            f"price_type '{ptype}' invalid; valid values: "
+            f"{sorted(_VALID_PRICE_TYPES)}"
+        )
+
+    qualifier = (price_qualifier or "").strip().upper()
+    if qualifier and qualifier not in _VALID_PRICE_QUALIFIERS:
+        errors.append(
+            f"price_qualifier '{qualifier}' invalid; valid: "
+            f"{sorted(_VALID_PRICE_QUALIFIERS)} (or empty for none)"
+        )
+
+    rows = offerings or []
+    if not (_PRICE_OFFERING_MIN <= len(rows) <= _PRICE_OFFERING_MAX):
+        errors.append(
+            f"price asset needs between {_PRICE_OFFERING_MIN} and "
+            f"{_PRICE_OFFERING_MAX} offerings; got {len(rows)}"
+        )
+
+    normalized_offerings: list[dict] = []
+    seen_headers: set[str] = set()
+    urls_to_check: list[str] = []
+    for i, row in enumerate(rows):
+        label = f"offering[{i}]"
+        header = str(row.get("header", "")).strip()
+        description = str(row.get("description", "")).strip()
+        url = str(row.get("final_url", "")).strip()
+        mobile_url = str(row.get("final_mobile_url", "")).strip()
+        unit = str(row.get("unit", "")).strip().upper()
+
+        if not header:
+            errors.append(f"{label}: header is required")
+        elif len(header) > _PRICE_TEXT_MAX:
+            errors.append(
+                f"{label}: header '{header}' is {len(header)} chars "
+                f"(max {_PRICE_TEXT_MAX})"
+            )
+        # Google rejects a price asset with two identical offering headers.
+        key = header.lower()
+        if key and key in seen_headers:
+            errors.append(f"{label}: duplicate header '{header}'")
+        seen_headers.add(key)
+
+        if not description:
+            errors.append(f"{label}: description is required")
+        elif len(description) > _PRICE_TEXT_MAX:
+            errors.append(
+                f"{label}: description '{description}' is "
+                f"{len(description)} chars (max {_PRICE_TEXT_MAX})"
+            )
+
+        try:
+            price = float(row.get("price", 0))
+        except (TypeError, ValueError):
+            price = 0.0
+            errors.append(f"{label}: price must be a number")
+        if price <= 0:
+            errors.append(f"{label}: price must be > 0")
+
+        if not url:
+            errors.append(f"{label}: final_url is required")
+        else:
+            urls_to_check.append(url)
+        if mobile_url:
+            urls_to_check.append(mobile_url)
+
+        if unit and unit not in _VALID_PRICE_UNITS:
+            errors.append(
+                f"{label}: unit '{unit}' invalid; valid: "
+                f"{sorted(_VALID_PRICE_UNITS)} (or empty for none)"
+            )
+
+        normalized_offerings.append(
+            {
+                "header": header,
+                "description": description,
+                "price": price,
+                "final_url": url,
+                "final_mobile_url": mobile_url,
+                "unit": unit,
+            }
+        )
+
+    if errors:
+        return {}, errors
+
+    # Only hit the network once validation has otherwise passed.
+    if urls_to_check:
+        url_checks = _validate_urls(list(dict.fromkeys(urls_to_check)))
+        for url, err in url_checks.items():
+            if err:
+                errors.append(f"final_url '{url}' is not reachable: {err}")
+        if errors:
+            return {}, errors
+
+    normalized = {
+        "price_type": ptype,
+        "price_qualifier": qualifier,
+        "language_code": (language_code or "en").lower(),
+        "currency_code": (currency_code or "USD").upper(),
+        "offerings": normalized_offerings,
+    }
+    return normalized, []
+
+
+def draft_price_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    price_type: str = "SERVICES",
+    price_qualifier: str = "FROM",
+    language_code: str = "en",
+    currency_code: str = "USD",
+    offerings: list[dict] | None = None,
+) -> dict:
+    """Draft a price extension asset — returns a PREVIEW.
+
+    Creates a PriceAsset (the price carousel that appears under an ad) and
+    links it at ad group, campaign, or customer scope. Exactly 3-8 offerings
+    are required by Google Ads.
+
+    Scope (most-specific wins):
+        - ad_group_id provided  → AdGroupAsset link.
+        - campaign_id provided  → CampaignAsset link.
+        - both empty            → CustomerAsset link (account-level).
+
+    Required:
+        price_type: what the prices describe — SERVICES, BRANDS, EVENTS,
+            LOCATIONS, NEIGHBORHOODS, PRODUCT_CATEGORIES, PRODUCT_TIERS,
+            SERVICE_CATEGORIES, SERVICE_TIERS.
+        offerings: list of 3-8 dicts, each with:
+            - header (str, <=25 chars, required, unique)
+            - description (str, <=25 chars, required)
+            - price (number, > 0, required) — in ``currency_code``
+            - final_url (str, required) — must return 2xx/3xx (validated)
+            - final_mobile_url (str, optional)
+            - unit (str, optional) — PER_HOUR, PER_DAY, PER_WEEK, PER_MONTH,
+              PER_YEAR, PER_NIGHT
+
+    Optional:
+        price_qualifier: FROM (default), UP_TO, or AVERAGE — leave blank for
+            none. "FROM" surfaces "From $X".
+        language_code: BCP-47 (default "en").
+        currency_code: ISO 4217 (default USD) — applied to every offering.
+
+    IMPORTANT: every price MUST match the price shown on its final_url
+    landing page. Google disapproves price assets whose amounts don't match
+    the page, and a mismatch erodes user trust. Verify the page before
+    drafting.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_price_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    normalized, errors = _validate_price_inputs(
+        price_type=price_type,
+        price_qualifier=price_qualifier,
+        language_code=language_code,
+        currency_code=currency_code,
+        offerings=offerings,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+    plan = ChangePlan(
+        operation="create_price_asset",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "price": normalized,
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
 def draft_promotion(
     config: AdLoopConfig,
     *,
@@ -1863,16 +2121,19 @@ def draft_promotion(
     redemption_start_date: str = "",
     redemption_end_date: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     ad_schedule: list[dict] | None = None,
 ) -> dict:
     """Draft a promotion extension asset — returns a PREVIEW.
 
-    Creates a PromotionAsset and links it at campaign or customer scope.
-    Exactly one of money_off / percent_off must be provided.
+    Creates a PromotionAsset and links it at ad group, campaign, or customer
+    scope. Exactly one of money_off / percent_off must be provided.
 
-    Scope:
+    Scope (most-specific wins):
+        - ad_group_id provided  → AdGroupAsset link (per-service promo inside
+          a multi-ad-group campaign).
         - campaign_id provided  → CampaignAsset link.
-        - campaign_id empty     → CustomerAsset link (account-level).
+        - both empty            → CustomerAsset link (account-level).
 
     Required:
         promotion_target: what the promotion is for, e.g. "Window Tint"
@@ -1926,15 +2187,18 @@ def draft_promotion(
     if errors:
         return {"error": "Validation failed", "details": errors}
 
-    scope = "campaign" if campaign_id else "customer"
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
     plan = ChangePlan(
         operation="create_promotion",
-        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
-        entity_id=campaign_id or customer_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
             "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "promotion": normalized,
         },
     )
@@ -3217,6 +3481,7 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_location_asset": _apply_create_location_asset,
         "create_business_name_asset": _apply_create_business_name_asset,
         "create_promotion": _apply_create_promotion,
+        "create_price_asset": _apply_create_price_asset,
         "update_promotion": _apply_update_promotion,
         "link_asset_to_customer": _apply_link_asset_to_customer,
         "update_call_asset": _apply_update_call_asset,
@@ -4053,10 +4318,15 @@ def _apply_assets(
     *,
     scope: str = "campaign",
     campaign_id: str = "",
+    ad_group_id: str = "",
 ) -> dict:
-    """Create Asset rows + link them at campaign or customer scope.
+    """Create Asset rows + link them at ad group, campaign, or customer scope.
 
     scope:
+        - "ad_group" → AdGroupAsset (requires ad_group_id). Use for
+          per-service assets inside a multi-ad-group campaign so they don't
+          bleed onto sibling ad groups. CALLOUT, STRUCTURED_SNIPPET, and
+          PROMOTION all support AdGroupAsset linking per the Google Ads API.
         - "campaign" → CampaignAsset (requires campaign_id)
         - "customer" → CustomerAsset (account-level, applies to all eligible
           campaigns by default)
@@ -4072,7 +4342,17 @@ def _apply_assets(
         populate_asset(asset, payload)
         operations.append(op)
 
-    if scope == "campaign":
+    if scope == "ad_group":
+        if not ad_group_id:
+            raise ValueError("ad_group_id required for ad_group-scope assets")
+        for i in range(len(assets)):
+            op = client.get_type("MutateOperation")
+            aga = op.ad_group_asset_operation.create
+            aga.asset = asset_service.asset_path(cid, str(-(i + 1)))
+            aga.ad_group = googleads_service.ad_group_path(cid, ad_group_id)
+            aga.field_type = field_type
+            operations.append(op)
+    elif scope == "campaign":
         if not campaign_id:
             raise ValueError("campaign_id is required for campaign-scope assets")
         for i in range(len(assets)):
@@ -4096,7 +4376,10 @@ def _apply_assets(
         customer_id=cid, mutate_operations=operations
     )
 
-    if scope == "campaign":
+    if scope == "ad_group":
+        results = {"assets": [], "ad_group_assets": []}
+        link_key = "ad_group_assets"
+    elif scope == "campaign":
         results = {"assets": [], "campaign_assets": []}
         link_key = "campaign_assets"
     else:
@@ -4108,6 +4391,8 @@ def _apply_assets(
         resource = None
         if resp.asset_result.resource_name:
             resource = resp.asset_result.resource_name
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            resource = resp.ad_group_asset_result.resource_name
         elif scope == "campaign" and resp.campaign_asset_result.resource_name:
             resource = resp.campaign_asset_result.resource_name
         elif scope == "customer" and resp.customer_asset_result.resource_name:
@@ -4137,6 +4422,7 @@ def _apply_create_callouts(client: object, cid: str, changes: dict) -> dict:
         populate,
         scope=changes.get("scope", "campaign"),
         campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
     )
 
 
@@ -4157,6 +4443,7 @@ def _apply_create_structured_snippets(
         populate,
         scope=changes.get("scope", "campaign"),
         campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
     )
 
 
@@ -4964,6 +5251,55 @@ def _apply_create_promotion(client: object, cid: str, changes: dict) -> dict:
         populate,
         scope=changes.get("scope", "campaign"),
         campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
+    )
+
+
+def _populate_price_asset(client: object, asset: object, price: dict) -> None:
+    """Fill an Asset proto with PriceAsset fields from a normalized dict."""
+    p = asset.price_asset
+    p.type_ = getattr(
+        client.enums.PriceExtensionTypeEnum, price["price_type"]
+    )
+    if price.get("price_qualifier"):
+        p.price_qualifier = getattr(
+            client.enums.PriceExtensionPriceQualifierEnum,
+            price["price_qualifier"],
+        )
+    p.language_code = price.get("language_code") or "en"
+
+    currency = price.get("currency_code") or "USD"
+    for row in price["offerings"]:
+        offering = client.get_type("PriceOffering")
+        offering.header = row["header"]
+        offering.description = row["description"]
+        offering.price.amount_micros = int(float(row["price"]) * 1_000_000)
+        offering.price.currency_code = currency
+        offering.final_url = row["final_url"]
+        if row.get("final_mobile_url"):
+            offering.final_mobile_url = row["final_mobile_url"]
+        if row.get("unit"):
+            offering.unit = getattr(
+                client.enums.PriceExtensionPriceUnitEnum, row["unit"]
+            )
+        p.price_offerings.append(offering)
+
+
+def _apply_create_price_asset(client: object, cid: str, changes: dict) -> dict:
+    """Create a PriceAsset and link it at ad group, campaign, or customer scope."""
+
+    def populate(asset: object, payload: dict) -> None:
+        _populate_price_asset(client, asset, payload)
+
+    return _apply_assets(
+        client,
+        cid,
+        [changes["price"]],
+        client.enums.AssetFieldTypeEnum.PRICE,
+        populate,
+        scope=changes.get("scope", "campaign"),
+        campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
     )
 
 

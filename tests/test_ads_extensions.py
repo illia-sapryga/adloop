@@ -492,6 +492,148 @@ class TestCustomerScopeAssets:
                 campaign_id="",
             )
 
+    # -----------------------------------------------------------------------
+    # Ad-group-level scope (CALLOUT / STRUCTURED_SNIPPET / PROMOTION all
+    # support AdGroupAsset linking per the Google Ads API). Mirrors the
+    # most-specific-wins precedence proven for draft_call_asset.
+    # -----------------------------------------------------------------------
+
+    def test_draft_callouts_with_ad_group_id_uses_ad_group_scope(self, config):
+        result = write.draft_callouts(
+            config,
+            customer_id="1234567890",
+            ad_group_id="199931082447",
+            callouts=["99.9% UV Protection"],
+        )
+        assert "error" not in result
+        assert result["entity_type"] == "ad_group_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.changes["ad_group_id"] == "199931082447"
+        assert plan.entity_id == "199931082447"
+
+    def test_draft_callouts_ad_group_wins_over_campaign(self, config):
+        """Most-specific-wins: ad_group_id beats campaign_id when both set."""
+        result = write.draft_callouts(
+            config,
+            customer_id="1234567890",
+            campaign_id="1001",
+            ad_group_id="199931082447",
+            callouts=["99.9% UV Protection"],
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.entity_type == "ad_group_asset"
+
+    def test_draft_structured_snippets_with_ad_group_id_uses_ad_group_scope(
+        self, config
+    ):
+        result = write.draft_structured_snippets(
+            config,
+            customer_id="1234567890",
+            ad_group_id="199931082447",
+            snippets=[{"header": "Services", "values": ["A", "B", "C"]}],
+        )
+        assert result["entity_type"] == "ad_group_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.changes["ad_group_id"] == "199931082447"
+
+    def test_apply_create_callouts_ad_group_scope_emits_ad_group_asset_op(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/199931082447~-1~CALLOUT",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+            }
+        )
+
+        result = write._apply_create_callouts(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "199931082447",
+                "callouts": ["99.9% UV Protection"],
+            },
+        )
+
+        assert len(google_ads.operations) == 2
+        asset_op = google_ads.operations[0].asset_operation.create
+        assert asset_op.callout_asset.callout_text == "99.9% UV Protection"
+        # Link is an AdGroupAsset bound to the right ad group (NOT campaign
+        # or customer scope).
+        link_op = google_ads.operations[1].ad_group_asset_operation.create
+        assert link_op.field_type == client.enums.AssetFieldTypeEnum.CALLOUT
+        assert link_op.ad_group == "customers/1/adGroups/199931082447"
+        assert (
+            google_ads.operations[1].campaign_asset_operation.create.field_type
+            == client.enums.AssetFieldTypeEnum.UNSPECIFIED
+        )
+        # Returned link surfaces under the ad_group_assets key.
+        assert result["ad_group_assets"] == [
+            "customers/1/adGroupAssets/199931082447~-1~CALLOUT"
+        ]
+
+    def test_apply_create_structured_snippets_ad_group_scope(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/199931082447~-1~STRUCTURED_SNIPPET",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+            }
+        )
+
+        write._apply_create_structured_snippets(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "199931082447",
+                "snippets": [{"header": "Services", "values": ["A", "B", "C"]}],
+            },
+        )
+        link_op = google_ads.operations[1].ad_group_asset_operation.create
+        assert (
+            link_op.field_type
+            == client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+        )
+        assert link_op.ad_group == "customers/1/adGroups/199931082447"
+
+    def test_apply_assets_ad_group_scope_requires_ad_group_id(self):
+        client = _FakeClient(
+            {
+                "GoogleAdsService": _FakeGoogleAdsService(),
+                "AssetService": _FakePathService("assets"),
+            }
+        )
+        with pytest.raises(ValueError, match="ad_group_id required"):
+            write._apply_assets(
+                client,
+                "1",
+                [{"callout_text": "X"}],
+                client.enums.AssetFieldTypeEnum.CALLOUT,
+                lambda asset, p: None,
+                scope="ad_group",
+                ad_group_id="",
+            )
+
 
 # ---------------------------------------------------------------------------
 # draft_call_asset
@@ -1813,6 +1955,39 @@ class TestDraftPromotion:
         assert plan.changes["scope"] == "campaign"
         assert plan.changes["campaign_id"] == "42"
 
+    def test_ad_group_scope_when_ad_group_id(self, config):
+        result = write.draft_promotion(
+            config,
+            customer_id="1234567890",
+            ad_group_id="194008868542",
+            promotion_target="Full Front PPF",
+            final_url="https://example.com/ppf",
+            money_off=900,
+            discount_modifier="UP_TO",
+            occasion="SUMMER_SALE",
+        )
+        assert "error" not in result
+        assert result["entity_type"] == "ad_group_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.changes["ad_group_id"] == "194008868542"
+        assert plan.entity_id == "194008868542"
+
+    def test_ad_group_scope_wins_over_campaign_scope(self, config):
+        """Most-specific-wins: ad_group_id beats campaign_id when both set."""
+        result = write.draft_promotion(
+            config,
+            customer_id="1234567890",
+            campaign_id="42",
+            ad_group_id="194008868542",
+            promotion_target="Full Front PPF",
+            final_url="https://example.com/ppf",
+            money_off=900,
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.entity_type == "ad_group_asset"
+
     def test_validation_failure_returns_error_dict(self, config):
         result = write.draft_promotion(
             config,
@@ -2013,6 +2188,64 @@ class TestApplyCreatePromotion:
 
         link_op = google_ads.operations[1].campaign_asset_operation.create
         assert link_op.field_type == client.enums.AssetFieldTypeEnum.PROMOTION
+
+    def test_ad_group_scope_emits_ad_group_asset(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/194008868542~-1~PROMOTION",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+            }
+        )
+
+        result = write._apply_create_promotion(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "194008868542",
+                "promotion": {
+                    "promotion_target": "Full Front PPF",
+                    "final_url": "https://example.com/ppf",
+                    "money_off": 900.0,
+                    "percent_off": 0,
+                    "currency_code": "USD",
+                    "promotion_code": "",
+                    "orders_over_amount": 0,
+                    "occasion": "SUMMER_SALE",
+                    "discount_modifier": "UP_TO",
+                    "language_code": "en",
+                    "start_date": "2026-06-03",
+                    "end_date": "2026-09-07",
+                    "redemption_start_date": "",
+                    "redemption_end_date": "",
+                    "ad_schedule": [],
+                },
+            },
+        )
+
+        asset_op = google_ads.operations[0].asset_operation.create
+        assert asset_op.promotion_asset.promotion_target == "Full Front PPF"
+        assert (
+            asset_op.promotion_asset.money_amount_off.amount_micros
+            == 900_000_000
+        )
+        # Link is an AdGroupAsset bound to the right ad group.
+        link_op = google_ads.operations[1].ad_group_asset_operation.create
+        assert link_op.field_type == client.enums.AssetFieldTypeEnum.PROMOTION
+        assert link_op.ad_group == "customers/1/adGroups/194008868542"
+        assert result["ad_group_assets"] == [
+            "customers/1/adGroupAssets/194008868542~-1~PROMOTION"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -2321,6 +2554,373 @@ class TestLinkAssetToCustomer:
 
         assert result["linked_count"] == 2
         assert len(result["customer_assets"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# draft_price_asset + _apply_create_price_asset
+# ---------------------------------------------------------------------------
+
+
+_PPF_URL = "https://bgitint.com/services/paint-protection-film-wrapping"
+
+
+def _ppf_offerings():
+    """The 3 BGI PPF offerings (all match the live landing page)."""
+    return [
+        {
+            "header": "Gold - Partial Front",
+            "description": "Hood, fenders, mirrors",
+            "price": 1095,
+            "final_url": _PPF_URL,
+        },
+        {
+            "header": "Platinum - Full Front",
+            "description": "Full front bumper + hood",
+            "price": 1899,
+            "final_url": _PPF_URL,
+        },
+        {
+            "header": "Diamond - Full Wrap",
+            "description": "Full vehicle coverage",
+            "price": 5800,
+            "final_url": _PPF_URL,
+        },
+    ]
+
+
+class TestDraftPriceAsset:
+    @pytest.fixture(autouse=True)
+    def _stub_urls(self, monkeypatch):
+        monkeypatch.setattr(
+            write,
+            "_validate_urls",
+            lambda urls, timeout=10: {u: None for u in urls},
+        )
+
+    def test_campaign_scope_three_offerings(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1234567890",
+            campaign_id="23878997650",
+            offerings=_ppf_offerings(),
+        )
+        assert "error" not in result
+        assert result["entity_type"] == "campaign_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "campaign"
+        assert plan.changes["campaign_id"] == "23878997650"
+        price = plan.changes["price"]
+        assert price["price_type"] == "SERVICES"
+        assert price["price_qualifier"] == "FROM"
+        assert len(price["offerings"]) == 3
+        assert price["offerings"][1]["price"] == 1899.0
+        assert price["offerings"][1]["header"] == "Platinum - Full Front"
+
+    def test_customer_scope_when_no_ids(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1234567890",
+            offerings=_ppf_offerings(),
+        )
+        assert result["entity_type"] == "customer_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "customer"
+
+    def test_ad_group_scope_wins_over_campaign(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1234567890",
+            campaign_id="23878997650",
+            ad_group_id="194008868542",
+            offerings=_ppf_offerings(),
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.entity_type == "ad_group_asset"
+        assert plan.changes["ad_group_id"] == "194008868542"
+
+    def test_too_few_offerings_rejected(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1234567890",
+            offerings=_ppf_offerings()[:2],
+        )
+        assert result["error"] == "Validation failed"
+        assert any("between 3 and 8" in d for d in result["details"])
+
+    def test_too_many_offerings_rejected(self, config):
+        nine = _ppf_offerings() * 3  # 9 offerings
+        result = write.draft_price_asset(
+            config,
+            customer_id="1234567890",
+            offerings=nine,
+        )
+        assert result["error"] == "Validation failed"
+        assert any("between 3 and 8" in d for d in result["details"])
+
+    def test_header_over_25_chars_rejected(self, config):
+        rows = _ppf_offerings()
+        rows[0]["header"] = "This Header Is Way Too Long To Fit"  # > 25
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=rows
+        )
+        assert result["error"] == "Validation failed"
+        assert any("header" in d and "max 25" in d for d in result["details"])
+
+    def test_duplicate_header_rejected(self, config):
+        rows = _ppf_offerings()
+        rows[2]["header"] = rows[0]["header"]  # dupe
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=rows
+        )
+        assert result["error"] == "Validation failed"
+        assert any("duplicate header" in d for d in result["details"])
+
+    def test_zero_price_rejected(self, config):
+        rows = _ppf_offerings()
+        rows[1]["price"] = 0
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=rows
+        )
+        assert result["error"] == "Validation failed"
+        assert any("price must be > 0" in d for d in result["details"])
+
+    def test_missing_final_url_rejected(self, config):
+        rows = _ppf_offerings()
+        rows[0]["final_url"] = ""
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=rows
+        )
+        assert result["error"] == "Validation failed"
+        assert any("final_url is required" in d for d in result["details"])
+
+    def test_invalid_price_type_rejected(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1",
+            price_type="BOGUS",
+            offerings=_ppf_offerings(),
+        )
+        assert result["error"] == "Validation failed"
+        assert any("price_type" in d for d in result["details"])
+
+    def test_invalid_qualifier_rejected(self, config):
+        result = write.draft_price_asset(
+            config,
+            customer_id="1",
+            price_qualifier="SOMETIMES",
+            offerings=_ppf_offerings(),
+        )
+        assert result["error"] == "Validation failed"
+        assert any("price_qualifier" in d for d in result["details"])
+
+    def test_invalid_unit_rejected(self, config):
+        rows = _ppf_offerings()
+        rows[0]["unit"] = "PER_FORTNIGHT"
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=rows
+        )
+        assert result["error"] == "Validation failed"
+        assert any("unit" in d for d in result["details"])
+
+    def test_unreachable_url_rejected(self, config, monkeypatch):
+        monkeypatch.setattr(
+            write,
+            "_validate_urls",
+            lambda urls, timeout=10: {u: "404 Not Found" for u in urls},
+        )
+        result = write.draft_price_asset(
+            config, customer_id="1", offerings=_ppf_offerings()
+        )
+        assert result["error"] == "Validation failed"
+        assert any("not reachable" in d for d in result["details"])
+
+
+class TestApplyCreatePriceAsset:
+    def test_campaign_scope_emits_price_asset(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "campaign_asset_result",
+                "customers/1/campaignAssets/23878997650~PRICE",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+            }
+        )
+
+        write._apply_create_price_asset(
+            client,
+            "1",
+            {
+                "scope": "campaign",
+                "campaign_id": "23878997650",
+                "ad_group_id": "",
+                "price": {
+                    "price_type": "SERVICES",
+                    "price_qualifier": "FROM",
+                    "language_code": "en",
+                    "currency_code": "USD",
+                    "offerings": [
+                        {
+                            "header": "Gold - Partial Front",
+                            "description": "Hood, fenders, mirrors",
+                            "price": 1095.0,
+                            "final_url": _PPF_URL,
+                            "final_mobile_url": "",
+                            "unit": "",
+                        },
+                        {
+                            "header": "Platinum - Full Front",
+                            "description": "Full front bumper + hood",
+                            "price": 1899.0,
+                            "final_url": _PPF_URL,
+                            "final_mobile_url": "",
+                            "unit": "",
+                        },
+                        {
+                            "header": "Diamond - Full Wrap",
+                            "description": "Full vehicle coverage",
+                            "price": 5800.0,
+                            "final_url": _PPF_URL,
+                            "final_mobile_url": "",
+                            "unit": "",
+                        },
+                    ],
+                },
+            },
+        )
+
+        assert len(google_ads.operations) == 2
+        asset_op = google_ads.operations[0].asset_operation.create
+        pa = asset_op.price_asset
+        assert pa.type_ == client.enums.PriceExtensionTypeEnum.SERVICES
+        assert (
+            pa.price_qualifier
+            == client.enums.PriceExtensionPriceQualifierEnum.FROM
+        )
+        assert len(pa.price_offerings) == 3
+        # Money encoded in micros, currency applied to every offering.
+        assert pa.price_offerings[1].header == "Platinum - Full Front"
+        assert pa.price_offerings[1].price.amount_micros == 1_899_000_000
+        assert pa.price_offerings[1].price.currency_code == "USD"
+        assert pa.price_offerings[2].price.amount_micros == 5_800_000_000
+        # Link is a CampaignAsset with PRICE field type.
+        link_op = google_ads.operations[1].campaign_asset_operation.create
+        assert link_op.field_type == client.enums.AssetFieldTypeEnum.PRICE
+        assert link_op.campaign == "customers/1/campaigns/23878997650"
+
+    def test_ad_group_scope_emits_ad_group_asset(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/194008868542~-1~PRICE",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+            }
+        )
+
+        result = write._apply_create_price_asset(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "194008868542",
+                "price": {
+                    "price_type": "SERVICES",
+                    "price_qualifier": "FROM",
+                    "language_code": "en",
+                    "currency_code": "USD",
+                    "offerings": [
+                        {
+                            "header": f"Pkg {n}",
+                            "description": "desc",
+                            "price": 100.0 * n,
+                            "final_url": _PPF_URL,
+                            "final_mobile_url": "",
+                            "unit": "",
+                        }
+                        for n in (1, 2, 3)
+                    ],
+                },
+            },
+        )
+
+        link_op = google_ads.operations[1].ad_group_asset_operation.create
+        assert link_op.field_type == client.enums.AssetFieldTypeEnum.PRICE
+        assert link_op.ad_group == "customers/1/adGroups/194008868542"
+        assert result["ad_group_assets"] == [
+            "customers/1/adGroupAssets/194008868542~-1~PRICE"
+        ]
+
+    def test_unit_enum_applied_when_present(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "campaign_asset_result", "customers/1/campaignAssets/9~PRICE"
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses)
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+            }
+        )
+
+        write._apply_create_price_asset(
+            client,
+            "1",
+            {
+                "scope": "campaign",
+                "campaign_id": "9",
+                "ad_group_id": "",
+                "price": {
+                    "price_type": "SERVICES",
+                    "price_qualifier": "",
+                    "language_code": "en",
+                    "currency_code": "USD",
+                    "offerings": [
+                        {
+                            "header": f"Plan {n}",
+                            "description": "desc",
+                            "price": 50.0 * n,
+                            "final_url": _PPF_URL,
+                            "final_mobile_url": "",
+                            "unit": "PER_MONTH",
+                        }
+                        for n in (1, 2, 3)
+                    ],
+                },
+            },
+        )
+        asset_op = google_ads.operations[0].asset_operation.create
+        assert (
+            asset_op.price_asset.price_offerings[0].unit
+            == client.enums.PriceExtensionPriceUnitEnum.PER_MONTH
+        )
+
+
+class TestPriceAssetDispatchWired:
+    def test_create_price_asset_in_dispatch(self):
+        import inspect
+
+        src = inspect.getsource(write._execute_plan)
+        assert '"create_price_asset": _apply_create_price_asset' in src
 
 
 class TestPromotionDispatchWired:

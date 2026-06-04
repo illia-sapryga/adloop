@@ -2156,13 +2156,17 @@ def update_ad_group(
 def draft_callouts(
     callouts: _StrList,
     campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
 ) -> dict:
     """Draft callout assets — returns a PREVIEW.
 
-    If ``campaign_id`` is empty, callouts attach at the customer/account
-    level (CustomerAsset) and apply to all eligible campaigns. Pass a
-    campaign_id to scope them to one campaign instead.
+    Scope (most-specific wins): if ``ad_group_id`` is set, callouts link to
+    that ad group (AdGroupAsset) — use this for per-service callouts inside a
+    multi-ad-group campaign so they don't bleed onto sibling ad groups. Else
+    if ``campaign_id`` is set, they scope to that campaign. If both are empty,
+    callouts attach at the customer/account level and apply to all eligible
+    campaigns.
     """
     from adloop.ads.write import draft_callouts as _impl
 
@@ -2170,6 +2174,7 @@ def draft_callouts(
         _config,
         customer_id=customer_id or _config.ads.customer_id,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         callouts=callouts,
     )
 
@@ -2179,12 +2184,15 @@ def draft_callouts(
 def draft_structured_snippets(
     snippets: _DictList,
     campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
 ) -> dict:
     """Draft structured snippet assets — returns a PREVIEW.
 
-    If ``campaign_id`` is empty, snippets attach at the customer/account
-    level. Pass a campaign_id to scope to one campaign.
+    Scope (most-specific wins): if ``ad_group_id`` is set, snippets link to
+    that ad group (AdGroupAsset). Else if ``campaign_id`` is set, they scope
+    to that campaign. If both are empty, snippets attach at the
+    customer/account level and apply to all eligible campaigns.
     """
     from adloop.ads.write import draft_structured_snippets as _impl
 
@@ -2192,6 +2200,7 @@ def draft_structured_snippets(
         _config,
         customer_id=customer_id or _config.ads.customer_id,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         snippets=snippets,
     )
 
@@ -2515,17 +2524,20 @@ def draft_promotion(
     redemption_start_date: str = "",
     redemption_end_date: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
     ad_schedule: list[dict] | None = None,
 ) -> dict:
     """Draft a promotion extension asset — returns a PREVIEW.
 
-    Creates a PromotionAsset and links it at campaign or customer scope.
-    Exactly one of money_off / percent_off must be provided.
+    Creates a PromotionAsset and links it at ad group, campaign, or customer
+    scope. Exactly one of money_off / percent_off must be provided.
 
-    Scope:
+    Scope (most-specific wins):
+        - ad_group_id provided  → AdGroupAsset link (per-service promo inside
+          a multi-ad-group campaign).
         - campaign_id provided  → CampaignAsset link.
-        - campaign_id empty     → CustomerAsset link (account-level, applies
+        - both empty            → CustomerAsset link (account-level, applies
           to every eligible campaign automatically).
 
     Required:
@@ -2571,7 +2583,68 @@ def draft_promotion(
         redemption_start_date=redemption_start_date,
         redemption_end_date=redemption_end_date,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         ad_schedule=ad_schedule,
+    )
+
+
+@mcp.tool(annotations=_WRITE)
+@_safe
+def draft_price_asset(
+    offerings: _DictList,
+    price_type: str = "SERVICES",
+    price_qualifier: str = "FROM",
+    language_code: str = "en",
+    currency_code: str = "USD",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    customer_id: str = "",
+) -> dict:
+    """Draft a price extension asset — returns a PREVIEW.
+
+    Creates a PriceAsset (the price carousel shown under an ad) with 3-8
+    offerings and links it at ad group, campaign, or customer scope.
+
+    Scope (most-specific wins): if ``ad_group_id`` is set, the price asset
+    links to that ad group (AdGroupAsset). Else if ``campaign_id`` is set, it
+    scopes to that campaign. If both are empty, it attaches at the
+    customer/account level and applies to all eligible campaigns.
+
+    Required:
+        offerings: list of 3-8 dicts, each with:
+            - header (str, <=25 chars, required, unique within the asset)
+            - description (str, <=25 chars, required)
+            - price (number, > 0, required) — in ``currency_code``
+            - final_url (str, required) — must return 2xx/3xx (validated)
+            - final_mobile_url (str, optional)
+            - unit (str, optional) — PER_HOUR, PER_DAY, PER_WEEK, PER_MONTH,
+              PER_YEAR, PER_NIGHT
+        price_type: SERVICES (default), BRANDS, EVENTS, LOCATIONS,
+            NEIGHBORHOODS, PRODUCT_CATEGORIES, PRODUCT_TIERS,
+            SERVICE_CATEGORIES, SERVICE_TIERS.
+
+    Optional:
+        price_qualifier: FROM (default), UP_TO, AVERAGE, or "" for none.
+        language_code: BCP-47 (default "en").
+        currency_code: ISO 4217 (default USD), applied to every offering.
+
+    IMPORTANT: every price MUST match the price on its final_url landing
+    page or Google disapproves the asset. Verify the page before drafting.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_price_asset as _impl
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        price_type=price_type,
+        price_qualifier=price_qualifier,
+        language_code=language_code,
+        currency_code=currency_code,
+        offerings=offerings,
     )
 
 
