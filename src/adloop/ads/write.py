@@ -2307,6 +2307,93 @@ def update_promotion(
     return preview
 
 
+def update_structured_snippet(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str,
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    header: str = "",
+    values: list[str] | None = None,
+) -> dict:
+    """Update a structured snippet via swap — returns a PREVIEW.
+
+    StructuredSnippetAsset fields (header + values) are immutable once the
+    asset is created in the Google Ads API, so "update" is implemented as a
+    swap (same pattern as update_promotion):
+        1. Create a new StructuredSnippetAsset with the updated header/values.
+        2. Link the new asset at the same scope.
+        3. Unlink the old asset link.
+
+    The old Asset row stays in the account (orphaned) — the Ads API does not
+    support hard-deleting Asset rows; Google reclaims orphaned ones in time.
+
+    asset_id: numeric ID of the existing StructuredSnippetAsset to replace.
+        Find it via: SELECT asset.id, asset.structured_snippet_asset.header,
+                     asset.structured_snippet_asset.values
+                     FROM asset WHERE asset.type = 'STRUCTURED_SNIPPET'
+
+    Scope (most-specific wins) — must match where the OLD asset is linked so
+    the swap unlinks the right link:
+        - ad_group_id provided  → AdGroupAsset.
+        - campaign_id provided  → CampaignAsset.
+        - both empty            → CustomerAsset (account-level).
+
+    header: official structured-snippet header (e.g. "Brands", "Services").
+    values: 3-10 values, each <= 25 chars.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_structured_snippet", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {
+            "error": "asset_id is required (the existing "
+            "StructuredSnippetAsset to replace)"
+        }
+
+    validated, errors = _validate_structured_snippets(
+        [{"header": header, "values": values or []}]
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+    warnings = [
+        "Update is a swap: a new StructuredSnippetAsset is created and "
+        "linked, the old link is unlinked. The old Asset row stays in the "
+        "account (orphaned) — Google Ads API does not support deleting "
+        "Asset rows."
+    ]
+
+    plan = ChangePlan(
+        operation="update_structured_snippet",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "old_asset_id": asset_id,
+            "snippet": validated[0],
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    preview["warnings"] = warnings
+    return preview
+
+
 # ---------------------------------------------------------------------------
 # In-place asset updates (call asset, sitelink, callout)
 # ---------------------------------------------------------------------------
@@ -3483,6 +3570,7 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_promotion": _apply_create_promotion,
         "create_price_asset": _apply_create_price_asset,
         "update_promotion": _apply_update_promotion,
+        "update_structured_snippet": _apply_update_structured_snippet,
         "link_asset_to_customer": _apply_link_asset_to_customer,
         "update_call_asset": _apply_update_call_asset,
         "update_sitelink": _apply_update_sitelink,
@@ -5425,6 +5513,169 @@ def _find_promotion_link(
             return row.campaign_asset.resource_name
         return row.customer_asset.resource_name
     return ""
+
+
+def _find_asset_link(
+    client: object,
+    cid: str,
+    asset_id: str,
+    field_type: str,
+    scope: str,
+    campaign_id: str,
+    ad_group_id: str,
+) -> str:
+    """Look up the AdGroupAsset / CampaignAsset / CustomerAsset link resource
+    name for a given asset_id and field type, across any of the three scopes.
+
+    Generalizes _find_promotion_link to ad-group scope and arbitrary field
+    types (used by the structured-snippet swap; reusable for any asset swap).
+    """
+    googleads_service = client.get_service("GoogleAdsService")
+    asset_service = client.get_service("AssetService")
+    asset_resource = asset_service.asset_path(cid, asset_id)
+
+    if scope == "ad_group":
+        if not ad_group_id:
+            return ""
+        ag_resource = googleads_service.ad_group_path(cid, ad_group_id)
+        query = (
+            "SELECT ad_group_asset.resource_name FROM ad_group_asset "
+            f"WHERE ad_group_asset.asset = '{asset_resource}' "
+            f"  AND ad_group_asset.ad_group = '{ag_resource}' "
+            f"  AND ad_group_asset.field_type = '{field_type}'"
+        )
+    elif scope == "campaign":
+        if not campaign_id:
+            return ""
+        camp_resource = client.get_service("CampaignService").campaign_path(
+            cid, campaign_id
+        )
+        query = (
+            "SELECT campaign_asset.resource_name FROM campaign_asset "
+            f"WHERE campaign_asset.asset = '{asset_resource}' "
+            f"  AND campaign_asset.campaign = '{camp_resource}' "
+            f"  AND campaign_asset.field_type = '{field_type}'"
+        )
+    else:
+        query = (
+            "SELECT customer_asset.resource_name FROM customer_asset "
+            f"WHERE customer_asset.asset = '{asset_resource}' "
+            f"  AND customer_asset.field_type = '{field_type}'"
+        )
+
+    response = googleads_service.search(customer_id=cid, query=query)
+    for row in response:
+        if scope == "ad_group":
+            return row.ad_group_asset.resource_name
+        if scope == "campaign":
+            return row.campaign_asset.resource_name
+        return row.customer_asset.resource_name
+    return ""
+
+
+def _apply_update_structured_snippet(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Swap a StructuredSnippetAsset: create new + link, then unlink old.
+
+    Mirrors _apply_update_promotion but generalized to ad-group / campaign /
+    customer scope via _find_asset_link.
+    """
+    asset_service = client.get_service("AssetService")
+    googleads_service = client.get_service("GoogleAdsService")
+    campaign_service = client.get_service("CampaignService")
+
+    scope = changes.get("scope", "customer")
+    campaign_id = changes.get("campaign_id", "")
+    ad_group_id = changes.get("ad_group_id", "")
+    old_asset_id = str(changes["old_asset_id"])
+    snippet = changes["snippet"]
+    field_type = client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+
+    operations = []
+
+    # 1. Create the new Asset.
+    create_op = client.get_type("MutateOperation")
+    new_asset = create_op.asset_operation.create
+    new_asset.resource_name = asset_service.asset_path(cid, "-1")
+    new_asset.structured_snippet_asset.header = snippet["header"]
+    new_asset.structured_snippet_asset.values.extend(snippet["values"])
+    operations.append(create_op)
+
+    # 2. Link the new Asset at the same scope as the old one.
+    link_op = client.get_type("MutateOperation")
+    if scope == "ad_group":
+        if not ad_group_id:
+            raise ValueError("ad_group_id required for ad_group-scope update")
+        aga = link_op.ad_group_asset_operation.create
+        aga.asset = asset_service.asset_path(cid, "-1")
+        aga.ad_group = googleads_service.ad_group_path(cid, ad_group_id)
+        aga.field_type = field_type
+    elif scope == "campaign":
+        if not campaign_id:
+            raise ValueError("campaign_id required for campaign-scope update")
+        ca = link_op.campaign_asset_operation.create
+        ca.asset = asset_service.asset_path(cid, "-1")
+        ca.campaign = campaign_service.campaign_path(cid, campaign_id)
+        ca.field_type = field_type
+    elif scope == "customer":
+        cust = link_op.customer_asset_operation.create
+        cust.asset = asset_service.asset_path(cid, "-1")
+        cust.field_type = field_type
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+    operations.append(link_op)
+
+    response = googleads_service.mutate(
+        customer_id=cid, mutate_operations=operations
+    )
+
+    new_asset_resource = ""
+    new_link_resource = ""
+    for resp in response.mutate_operation_responses:
+        if resp.asset_result.resource_name and not new_asset_resource:
+            new_asset_resource = resp.asset_result.resource_name
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            new_link_resource = resp.ad_group_asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
+            new_link_resource = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            new_link_resource = resp.customer_asset_result.resource_name
+
+    # 3. Find and unlink the old link.
+    old_link_resource = _find_asset_link(
+        client,
+        cid,
+        old_asset_id,
+        "STRUCTURED_SNIPPET",
+        scope,
+        campaign_id,
+        ad_group_id,
+    )
+    old_link_removed = ""
+    if old_link_resource:
+        if scope == "ad_group":
+            svc = client.get_service("AdGroupAssetService")
+            rm_op = client.get_type("AdGroupAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_ad_group_assets(customer_id=cid, operations=[rm_op])
+        elif scope == "campaign":
+            svc = client.get_service("CampaignAssetService")
+            rm_op = client.get_type("CampaignAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_campaign_assets(customer_id=cid, operations=[rm_op])
+        else:
+            svc = client.get_service("CustomerAssetService")
+            rm_op = client.get_type("CustomerAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_customer_assets(customer_id=cid, operations=[rm_op])
+        old_link_removed = old_link_resource
+
+    return {
+        "new_asset": new_asset_resource,
+        "new_link": new_link_resource,
+        "old_link_removed": old_link_removed,
+    }
 
 
 def _apply_link_asset_to_customer(

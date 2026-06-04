@@ -2717,6 +2717,54 @@ def update_promotion(
 
 @mcp.tool(annotations=_WRITE)
 @_safe
+def update_structured_snippet(
+    asset_id: str,
+    header: str,
+    values: _StrList,
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    customer_id: str = "",
+) -> dict:
+    """Update a structured snippet via swap — returns a PREVIEW.
+
+    StructuredSnippetAsset header + values are immutable once created, so
+    "update" is a SWAP:
+        1. Create a new StructuredSnippetAsset with the new header/values.
+        2. Link it at the same scope.
+        3. Unlink the old asset link.
+
+    The old Asset row stays in the account (orphaned) — Google Ads API does
+    not support hard-deleting Asset rows.
+
+    asset_id: numeric ID of the existing StructuredSnippetAsset (find via
+        SELECT asset.id, asset.structured_snippet_asset.header,
+        asset.structured_snippet_asset.values FROM asset
+        WHERE asset.type = 'STRUCTURED_SNIPPET').
+
+    Scope (most-specific wins) — must match where the OLD asset is linked:
+        if ad_group_id set → AdGroupAsset; elif campaign_id set →
+        CampaignAsset; else CustomerAsset (account-level).
+
+    header: official header (e.g. "Brands", "Services").
+    values: 3-10 values, each <= 25 chars.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_structured_snippet as _impl
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        asset_id=asset_id,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        header=header,
+        values=values,
+    )
+
+
+@mcp.tool(annotations=_WRITE)
+@_safe
 def link_asset_to_customer(
     links: list[dict],
     customer_id: str = "",

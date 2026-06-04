@@ -2279,6 +2279,19 @@ class _FakeCustomerAssetService(_FakePathService):
         return SimpleNamespace(results=self._responses)
 
 
+class _FakeAdGroupAssetService(_FakePathService):
+    def __init__(self, responses: list[_FakeResult] | None = None):
+        super().__init__("adGroupAssets")
+        self.operations = None
+        self._responses = responses or []
+
+    def mutate_ad_group_assets(
+        self, customer_id: str, operations: list[object]
+    ) -> object:
+        self.operations = operations
+        return SimpleNamespace(results=self._responses)
+
+
 class TestApplyUpdatePromotion:
     def _promo(self, **overrides):
         base = {
@@ -2451,6 +2464,226 @@ class TestApplyUpdatePromotion:
 # ---------------------------------------------------------------------------
 # Dispatch wiring
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# update_structured_snippet (swap)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateStructuredSnippet:
+    def test_requires_asset_id(self, config):
+        result = write.update_structured_snippet(
+            config,
+            customer_id="1",
+            asset_id="",
+            header="Brands",
+            values=["A", "B", "C"],
+        )
+        assert "asset_id is required" in result["error"]
+
+    def test_invalid_header_rejected(self, config):
+        result = write.update_structured_snippet(
+            config,
+            customer_id="1",
+            asset_id="369181908933",
+            header="NotARealHeader",
+            values=["A", "B", "C"],
+        )
+        assert result["error"] == "Validation failed"
+
+    def test_too_few_values_rejected(self, config):
+        result = write.update_structured_snippet(
+            config,
+            customer_id="1",
+            asset_id="369181908933",
+            header="Brands",
+            values=["A", "B"],
+        )
+        assert result["error"] == "Validation failed"
+
+    def test_customer_scope_swap_plan(self, config):
+        result = write.update_structured_snippet(
+            config,
+            customer_id="1",
+            asset_id="369181908933",
+            header="Brands",
+            values=["LLumar", "STEK", "Rayno", "BLASK", "Feynlab", "Carlas"],
+        )
+        assert "error" not in result
+        assert result["entity_type"] == "customer_asset"
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.operation == "update_structured_snippet"
+        assert plan.changes["scope"] == "customer"
+        assert plan.changes["old_asset_id"] == "369181908933"
+        assert plan.changes["snippet"]["header"] == "Brands"
+        assert len(plan.changes["snippet"]["values"]) == 6
+        assert any("swap" in w.lower() for w in result["warnings"])
+
+    def test_ad_group_scope_wins(self, config):
+        result = write.update_structured_snippet(
+            config,
+            customer_id="1",
+            asset_id="369181908933",
+            campaign_id="42",
+            ad_group_id="199931082447",
+            header="Brands",
+            values=["A", "B", "C"],
+        )
+        plan = preview_store._pending_plans[result["plan_id"]]
+        assert plan.changes["scope"] == "ad_group"
+        assert plan.entity_type == "ad_group_asset"
+
+
+class TestApplyUpdateStructuredSnippet:
+    def test_customer_swap_creates_new_unlinks_old(self):
+        search_row = SimpleNamespace(
+            customer_asset=SimpleNamespace(
+                resource_name="customers/1/customerAssets/99~STRUCTURED_SNIPPET"
+            )
+        )
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "customer_asset_result",
+                "customers/1/customerAssets/-1~STRUCTURED_SNIPPET",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses, search_rows=[search_row])
+        cust_service = _FakeCustomerAssetService([_FakeResult("removed")])
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+                "CustomerAssetService": cust_service,
+            }
+        )
+
+        result = write._apply_update_structured_snippet(
+            client,
+            "1",
+            {
+                "scope": "customer",
+                "campaign_id": "",
+                "ad_group_id": "",
+                "old_asset_id": "99",
+                "snippet": {
+                    "header": "Brands",
+                    "values": ["LLumar", "STEK", "Rayno", "BLASK", "Feynlab", "Carlas"],
+                },
+            },
+        )
+
+        # Step 1+2: create + link in one mutate batch.
+        assert len(google_ads.operations) == 2
+        new_asset_op = google_ads.operations[0].asset_operation.create
+        assert new_asset_op.structured_snippet_asset.header == "Brands"
+        assert list(new_asset_op.structured_snippet_asset.values) == [
+            "LLumar", "STEK", "Rayno", "BLASK", "Feynlab", "Carlas"
+        ]
+        link_op = google_ads.operations[1].customer_asset_operation.create
+        assert (
+            link_op.field_type
+            == client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+        )
+        # Step 3: old link unlinked via CustomerAssetService.
+        assert cust_service.operations is not None
+        assert (
+            cust_service.operations[0].remove
+            == "customers/1/customerAssets/99~STRUCTURED_SNIPPET"
+        )
+        assert result["old_link_removed"] == (
+            "customers/1/customerAssets/99~STRUCTURED_SNIPPET"
+        )
+
+    def test_ad_group_swap_uses_ad_group_asset_service(self):
+        search_row = SimpleNamespace(
+            ad_group_asset=SimpleNamespace(
+                resource_name="customers/1/adGroupAssets/55~99~STRUCTURED_SNIPPET"
+            )
+        )
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "ad_group_asset_result",
+                "customers/1/adGroupAssets/55~-1~STRUCTURED_SNIPPET",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses, search_rows=[search_row])
+        aga_service = _FakeAdGroupAssetService([_FakeResult("removed")])
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+                "AdGroupAssetService": aga_service,
+            }
+        )
+
+        result = write._apply_update_structured_snippet(
+            client,
+            "1",
+            {
+                "scope": "ad_group",
+                "campaign_id": "",
+                "ad_group_id": "55",
+                "old_asset_id": "99",
+                "snippet": {"header": "Services", "values": ["A", "B", "C"]},
+            },
+        )
+
+        link_op = google_ads.operations[1].ad_group_asset_operation.create
+        assert link_op.ad_group == "customers/1/adGroups/55"
+        assert aga_service.operations[0].remove == (
+            "customers/1/adGroupAssets/55~99~STRUCTURED_SNIPPET"
+        )
+        assert result["new_asset"] == "customers/1/assets/-1"
+
+    def test_swap_when_old_link_not_found_skips_unlink(self):
+        responses = [
+            _FakeMutateOperationResponse("asset_result", "customers/1/assets/-1"),
+            _FakeMutateOperationResponse(
+                "customer_asset_result",
+                "customers/1/customerAssets/-1~STRUCTURED_SNIPPET",
+            ),
+        ]
+        google_ads = _FakeGoogleAdsService(responses, search_rows=[])
+        cust_service = _FakeCustomerAssetService([])
+        client = _FakeClient(
+            {
+                "GoogleAdsService": google_ads,
+                "AssetService": _FakePathService("assets"),
+                "CampaignService": _FakePathService("campaigns"),
+                "CustomerAssetService": cust_service,
+            }
+        )
+
+        result = write._apply_update_structured_snippet(
+            client,
+            "1",
+            {
+                "scope": "customer",
+                "campaign_id": "",
+                "ad_group_id": "",
+                "old_asset_id": "99",
+                "snippet": {"header": "Brands", "values": ["A", "B", "C"]},
+            },
+        )
+        # No old link found → unlink skipped, no exception.
+        assert result["old_link_removed"] == ""
+        assert cust_service.operations is None
+
+
+class TestStructuredSnippetSwapDispatchWired:
+    def test_update_structured_snippet_in_dispatch(self):
+        import inspect
+
+        src = inspect.getsource(write._execute_plan)
+        assert (
+            '"update_structured_snippet": _apply_update_structured_snippet'
+            in src
+        )
 
 
 # ---------------------------------------------------------------------------
