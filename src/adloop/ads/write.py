@@ -2920,6 +2920,230 @@ def update_callout(
 
 
 # ---------------------------------------------------------------------------
+# Location + business-name assets
+# ---------------------------------------------------------------------------
+
+
+def draft_location_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    business_profile_account_id: str = "",
+    asset_set_name: str = "",
+    campaign_id: str = "",
+    label_filters: list[str] | None = None,
+    listing_id_filters: list[str] | None = None,
+) -> dict:
+    """Draft a Google Business Profile-backed location AssetSet — PREVIEW.
+
+    Creates an ``AssetSet`` of type LOCATION_SYNC that pulls locations from a
+    linked Google Business Profile and exposes them as location assets. The
+    set is attached at the customer level (so all eligible campaigns get it by
+    default). Optionally also creates a ``CampaignAssetSet`` link to a specific
+    campaign.
+
+    Required preflight: the Google Business Profile must already be linked in
+    Google Ads → Tools → Linked accounts → Business Profile.
+
+    business_profile_account_id: numeric Business Profile (LBC) account ID.
+    asset_set_name: optional name for the AssetSet. Defaults to
+        "GBP Locations - <business_profile_account_id>".
+    label_filters: optional list of GBP location labels to limit sync.
+    listing_id_filters: optional list of GBP listing IDs to limit sync.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_location_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not business_profile_account_id:
+        return {
+            "error": (
+                "business_profile_account_id is required (numeric GBP/LBC account ID). "
+                "Find it in Google Business Profile admin."
+            )
+        }
+
+    name = asset_set_name or f"GBP Locations - {business_profile_account_id}"
+    warnings = [
+        "The Google Business Profile must already be linked at Tools -> Linked "
+        "accounts -> Business Profile in Google Ads. If it isn't, this tool "
+        "will fail at apply time."
+    ]
+
+    plan = ChangePlan(
+        operation="create_location_asset",
+        entity_type="asset_set",
+        entity_id=customer_id,
+        customer_id=customer_id,
+        changes={
+            "scope": "campaign" if campaign_id else "customer",
+            "campaign_id": campaign_id,
+            "business_profile_account_id": str(business_profile_account_id),
+            "asset_set_name": name,
+            "label_filters": list(label_filters or []),
+            "listing_id_filters": [str(x) for x in (listing_id_filters or [])],
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    preview["warnings"] = warnings
+    return preview
+
+
+def draft_business_name_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_id: str = "",
+    business_name: str = "",
+) -> dict:
+    """Draft a business-name asset — returns a PREVIEW.
+
+    Creates a TEXT asset and links it as ``BUSINESS_NAME`` at customer or
+    campaign scope. Google shows the business name alongside ads so users can
+    recognize the brand at a glance.
+
+    Scope:
+        - If ``campaign_id`` is empty (default), the asset is linked at the
+          customer/account level via CustomerAsset.
+        - If ``campaign_id`` is provided, the asset is scoped to that single
+          campaign via CampaignAsset.
+
+    business_name: max 25 characters per Google Ads policy.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_business_name_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    text = (business_name or "").strip()
+    if not text:
+        return {"error": "business_name is required"}
+    if len(text) > 25:
+        return {
+            "error": "Validation failed",
+            "details": [
+                f"business_name '{text}' is {len(text)} chars (max 25)"
+            ],
+        }
+
+    scope = "campaign" if campaign_id else "customer"
+    plan = ChangePlan(
+        operation="create_business_name_asset",
+        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
+        entity_id=campaign_id or customer_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "business_name": text,
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+# ---------------------------------------------------------------------------
+# link_asset_to_customer — promote existing assets to customer/account scope
+# ---------------------------------------------------------------------------
+
+# AssetFieldType values that are valid for CustomerAsset (account-level).
+_VALID_CUSTOMER_ASSET_FIELD_TYPES = {
+    "SITELINK", "CALLOUT", "STRUCTURED_SNIPPET", "PROMOTION", "PRICE",
+    "CALL", "MOBILE_APP", "HOTEL_CALLOUT", "BUSINESS_LOGO", "BUSINESS_NAME",
+    "AD_IMAGE", "MARKETING_IMAGE", "SQUARE_MARKETING_IMAGE",
+    "PORTRAIT_MARKETING_IMAGE", "LOGO", "LANDSCAPE_LOGO",
+    "YOUTUBE_VIDEO", "MEDIA_BUNDLE", "BOOK_ON_GOOGLE", "LEAD_FORM",
+    "HEADLINE", "DESCRIPTION", "LONG_HEADLINE",
+}
+
+
+def link_asset_to_customer(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    links: list[dict] | None = None,
+) -> dict:
+    """Link EXISTING assets to the customer (account) — returns a PREVIEW.
+
+    Use this to "promote" assets that already exist in the account (typically
+    attached to legacy campaigns) so they apply at the account level and
+    inherit to every eligible campaign automatically.
+
+    Unlike draft_image_assets / draft_callouts / etc., this tool does NOT
+    create new Asset rows — it only adds CustomerAsset link rows pointing to
+    assets you already have. Find candidate asset_ids via:
+        SELECT asset.id, asset.type, asset.name FROM asset
+
+    links: list of dicts, each with:
+        - asset_id (str, required) — numeric asset ID
+        - field_type (str, required) — AssetFieldType, e.g. BUSINESS_LOGO,
+          AD_IMAGE, MARKETING_IMAGE, BUSINESS_NAME, SITELINK, CALLOUT, CALL,
+          PROMOTION, etc.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("link_asset_to_customer", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not links:
+        return {"error": "At least one link is required"}
+
+    errors: list[str] = []
+    validated: list[dict] = []
+    for i, item in enumerate(links):
+        if not isinstance(item, dict):
+            errors.append(f"Link {i + 1}: must be a dict, got {type(item).__name__}")
+            continue
+        asset_id = str(item.get("asset_id", "")).strip()
+        field_type = str(item.get("field_type", "")).strip().upper()
+        if not asset_id:
+            errors.append(f"Link {i + 1}: asset_id is required")
+            continue
+        if not asset_id.isdigit():
+            errors.append(
+                f"Link {i + 1}: asset_id '{asset_id}' must be numeric"
+            )
+            continue
+        if not field_type:
+            errors.append(f"Link {i + 1}: field_type is required")
+            continue
+        if field_type not in _VALID_CUSTOMER_ASSET_FIELD_TYPES:
+            errors.append(
+                f"Link {i + 1}: field_type '{field_type}' is not valid for "
+                f"CustomerAsset; valid: "
+                f"{sorted(_VALID_CUSTOMER_ASSET_FIELD_TYPES)}"
+            )
+            continue
+        validated.append({"asset_id": asset_id, "field_type": field_type})
+
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    plan = ChangePlan(
+        operation="link_asset_to_customer",
+        entity_type="customer_asset",
+        entity_id=customer_id,
+        customer_id=customer_id,
+        changes={"links": validated},
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+# ---------------------------------------------------------------------------
 # confirm_and_apply — the only function that actually mutates Google Ads
 # ---------------------------------------------------------------------------
 
@@ -3804,6 +4028,9 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "update_call_asset": _apply_update_call_asset,
         "update_sitelink": _apply_update_sitelink,
         "update_callout": _apply_update_callout,
+        "create_location_asset": _apply_create_location_asset,
+        "create_business_name_asset": _apply_create_business_name_asset,
+        "link_asset_to_customer": _apply_link_asset_to_customer,
     }
 
     handler = dispatch.get(plan.operation)
@@ -5372,6 +5599,148 @@ def _apply_update_callout(client: object, cid: str, changes: dict) -> dict:
     ))
     response = asset_service.mutate_assets(customer_id=cid, operations=[op])
     return {"resource_name": response.results[0].resource_name}
+
+
+def _apply_create_location_asset(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Create a LOCATION_SYNC AssetSet linked to a Google Business Profile.
+
+    Steps:
+      1. Create AssetSet (type=LOCATION_SYNC, business_profile_location_set).
+      2. Create CustomerAssetSet linking the set to the customer (customer scope).
+      3. Or create CampaignAssetSet linking it to one campaign (campaign scope).
+    """
+    asset_set_service = client.get_service("AssetSetService")
+
+    # Step 1 — create AssetSet
+    set_op = client.get_type("AssetSetOperation")
+    asset_set = set_op.create
+    asset_set.name = changes["asset_set_name"]
+    asset_set.type_ = client.enums.AssetSetTypeEnum.LOCATION_SYNC
+    bpls = asset_set.location_set.business_profile_location_set
+    # business_account_id is exposed as STRING by proto-plus even though the
+    # value is a numeric GBP/LBC account id.
+    bpls.business_account_id = str(changes["business_profile_account_id"])
+    for label in changes.get("label_filters") or []:
+        bpls.label_filters.append(label)
+    for listing_id in changes.get("listing_id_filters") or []:
+        bpls.listing_id_filters.append(int(listing_id))
+
+    set_response = asset_set_service.mutate_asset_sets(
+        customer_id=cid, operations=[set_op]
+    )
+    asset_set_resource = set_response.results[0].resource_name
+
+    result = {"asset_set": asset_set_resource}
+
+    # Step 2/3 — link to customer or campaign
+    scope = changes.get("scope", "customer")
+    if scope == "customer":
+        cas_service = client.get_service("CustomerAssetSetService")
+        cas_op = client.get_type("CustomerAssetSetOperation")
+        cas_op.create.asset_set = asset_set_resource
+        cas_response = cas_service.mutate_customer_asset_sets(
+            customer_id=cid, operations=[cas_op]
+        )
+        result["customer_asset_set"] = cas_response.results[0].resource_name
+    elif scope == "campaign":
+        if not changes.get("campaign_id"):
+            raise ValueError("campaign_id required for campaign-scope location asset")
+        campaign_service = client.get_service("CampaignService")
+        cas_service = client.get_service("CampaignAssetSetService")
+        cas_op = client.get_type("CampaignAssetSetOperation")
+        cas_op.create.asset_set = asset_set_resource
+        cas_op.create.campaign = campaign_service.campaign_path(
+            cid, changes["campaign_id"]
+        )
+        cas_response = cas_service.mutate_campaign_asset_sets(
+            customer_id=cid, operations=[cas_op]
+        )
+        result["campaign_asset_set"] = cas_response.results[0].resource_name
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+
+    return result
+
+
+def _apply_create_business_name_asset(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Create a TEXT asset and link as BUSINESS_NAME at customer or campaign scope."""
+    asset_service = client.get_service("AssetService")
+    googleads_service = client.get_service("GoogleAdsService")
+    operations: list = []
+
+    # 1) Create Asset (TEXT)
+    op = client.get_type("MutateOperation")
+    asset = op.asset_operation.create
+    asset.resource_name = asset_service.asset_path(cid, "-1")
+    asset.type_ = client.enums.AssetTypeEnum.TEXT
+    asset.text_asset.text = changes["business_name"]
+    operations.append(op)
+
+    # 2) Link as BUSINESS_NAME
+    scope = changes.get("scope", "customer")
+    link_op = client.get_type("MutateOperation")
+    if scope == "campaign":
+        if not changes.get("campaign_id"):
+            raise ValueError("campaign_id required for campaign-scope business_name asset")
+        link = link_op.campaign_asset_operation.create
+        link.asset = asset_service.asset_path(cid, "-1")
+        link.campaign = googleads_service.campaign_path(cid, changes["campaign_id"])
+        link.field_type = client.enums.AssetFieldTypeEnum.BUSINESS_NAME
+    elif scope == "customer":
+        link = link_op.customer_asset_operation.create
+        link.asset = asset_service.asset_path(cid, "-1")
+        link.field_type = client.enums.AssetFieldTypeEnum.BUSINESS_NAME
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+    operations.append(link_op)
+
+    response = googleads_service.mutate(
+        customer_id=cid, mutate_operations=operations
+    )
+
+    result = {"asset": "", "link": ""}
+    for resp in response.mutate_operation_responses:
+        if resp.asset_result.resource_name and not result["asset"]:
+            result["asset"] = resp.asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
+            result["link"] = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            result["link"] = resp.customer_asset_result.resource_name
+    return result
+
+
+def _apply_link_asset_to_customer(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Create CustomerAsset link rows pointing to existing Asset rows.
+
+    Does NOT create new Asset rows — only the link. Use this to promote
+    existing assets (e.g. images, logos on a legacy campaign) to account level.
+    """
+    asset_service = client.get_service("AssetService")
+    cust_service = client.get_service("CustomerAssetService")
+
+    operations = []
+    for link in changes["links"]:
+        op = client.get_type("CustomerAssetOperation")
+        ca = op.create
+        ca.asset = asset_service.asset_path(cid, link["asset_id"])
+        ca.field_type = getattr(
+            client.enums.AssetFieldTypeEnum, link["field_type"]
+        )
+        operations.append(op)
+
+    response = cust_service.mutate_customer_assets(
+        customer_id=cid, operations=operations
+    )
+    return {
+        "customer_assets": [r.resource_name for r in response.results],
+        "linked_count": len(response.results),
+    }
 
 
 def _apply_create_negative_keyword_list(

@@ -1005,3 +1005,199 @@ def test_apply_update_structured_snippet_swaps_ad_group_link():
     ]
     assert result["old_link_removed"].endswith("adGroupAssets/OLD")
     assert aga_service.operations[0].remove.endswith("adGroupAssets/OLD")
+
+
+# ---------------------------------------------------------------------------
+# draft_business_name_asset
+# ---------------------------------------------------------------------------
+
+
+def test_draft_business_name_requires_name(config):
+    result = write.draft_business_name_asset(config, customer_id="123-456-7890")
+    assert result["error"] == "business_name is required"
+
+
+def test_draft_business_name_rejects_long_name(config):
+    result = write.draft_business_name_asset(
+        config,
+        customer_id="123-456-7890",
+        business_name="A Business Name That Is Way Too Long",
+    )
+    assert result["error"] == "Validation failed"
+
+
+def test_draft_business_name_campaign_scope(config):
+    result = write.draft_business_name_asset(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        business_name="Example Plumbing",
+    )
+    assert result["operation"] == "create_business_name_asset"
+    assert result["changes"]["scope"] == "campaign"
+
+
+def test_apply_create_business_name_asset_customer_scope():
+    responses = [
+        _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/1"),
+        _FakeMutateOperationResponse(
+            "customer_asset_result", "customers/1234567890/customerAssets/1"
+        ),
+    ]
+    google_ads_service, client = _asset_link_client(responses)
+
+    result = write._apply_create_business_name_asset(
+        client,
+        "1234567890",
+        {"scope": "customer", "campaign_id": "", "business_name": "Example Plumbing"},
+    )
+    create = google_ads_service.operations[0].asset_operation.create
+    assert create.text_asset.text == "Example Plumbing"
+    assert create.type_ == client.enums.AssetTypeEnum.TEXT
+    link = google_ads_service.operations[1].customer_asset_operation.create
+    assert link.field_type == client.enums.AssetFieldTypeEnum.BUSINESS_NAME
+    assert result["link"].endswith("customerAssets/1")
+
+
+# ---------------------------------------------------------------------------
+# draft_location_asset
+# ---------------------------------------------------------------------------
+
+
+def test_draft_location_asset_requires_gbp_id(config):
+    result = write.draft_location_asset(config, customer_id="123-456-7890")
+    assert "business_profile_account_id is required" in result["error"]
+
+
+def test_draft_location_asset_default_name_and_warning(config):
+    result = write.draft_location_asset(
+        config,
+        customer_id="123-456-7890",
+        business_profile_account_id="9988776655",
+    )
+    assert result["operation"] == "create_location_asset"
+    assert result["changes"]["asset_set_name"] == "GBP Locations - 9988776655"
+    assert result["changes"]["scope"] == "customer"
+    assert result["warnings"]
+
+
+def test_apply_create_location_asset_customer_scope():
+    asset_set_service = _FakeAssetSetService()
+    cas_service = _FakeAssetSetLinkService("customerAssetSets")
+    client = _FakeClient(
+        {
+            "AssetSetService": asset_set_service,
+            "CustomerAssetSetService": cas_service,
+        }
+    )
+    result = write._apply_create_location_asset(
+        client,
+        "1234567890",
+        {
+            "scope": "customer",
+            "campaign_id": "",
+            "business_profile_account_id": "9988776655",
+            "asset_set_name": "GBP Locations - 9988776655",
+            "label_filters": ["storefront"],
+            "listing_id_filters": ["12345"],
+        },
+    )
+    set_create = asset_set_service.operations[0].create
+    assert set_create.type_ == client.enums.AssetSetTypeEnum.LOCATION_SYNC
+    bpls = set_create.location_set.business_profile_location_set
+    assert bpls.business_account_id == "9988776655"
+    assert list(bpls.label_filters) == ["storefront"]
+    assert list(bpls.listing_id_filters) == [12345]
+    assert result["asset_set"].endswith("assetSets/1")
+    assert result["customer_asset_set"].endswith("customerAssetSets/1")
+
+
+def test_apply_create_location_asset_campaign_scope():
+    asset_set_service = _FakeAssetSetService()
+    cas_service = _FakeAssetSetLinkService("campaignAssetSets")
+    client = _FakeClient(
+        {
+            "AssetSetService": asset_set_service,
+            "CampaignAssetSetService": cas_service,
+            "CampaignService": _FakePathService("campaigns"),
+        }
+    )
+    result = write._apply_create_location_asset(
+        client,
+        "1234567890",
+        {
+            "scope": "campaign",
+            "campaign_id": "1001",
+            "business_profile_account_id": "9988776655",
+            "asset_set_name": "GBP Locations",
+            "label_filters": [],
+            "listing_id_filters": [],
+        },
+    )
+    assert result["campaign_asset_set"].endswith("campaignAssetSets/1")
+    link = cas_service.operations[0].create
+    assert link.campaign.endswith("campaigns/1001")
+
+
+# ---------------------------------------------------------------------------
+# link_asset_to_customer
+# ---------------------------------------------------------------------------
+
+
+def test_link_asset_requires_links(config):
+    result = write.link_asset_to_customer(config, customer_id="123-456-7890")
+    assert result["error"] == "At least one link is required"
+
+
+def test_link_asset_rejects_non_numeric_id(config):
+    result = write.link_asset_to_customer(
+        config,
+        customer_id="123-456-7890",
+        links=[{"asset_id": "abc", "field_type": "BUSINESS_LOGO"}],
+    )
+    assert result["error"] == "Validation failed"
+    assert any("must be numeric" in d for d in result["details"])
+
+
+def test_link_asset_rejects_bad_field_type(config):
+    result = write.link_asset_to_customer(
+        config,
+        customer_id="123-456-7890",
+        links=[{"asset_id": "555", "field_type": "NOT_A_TYPE"}],
+    )
+    assert result["error"] == "Validation failed"
+    assert any("not valid for" in d for d in result["details"])
+
+
+def test_link_asset_preview_ok(config):
+    result = write.link_asset_to_customer(
+        config,
+        customer_id="123-456-7890",
+        links=[{"asset_id": "555", "field_type": "business_logo"}],
+    )
+    assert result["operation"] == "link_asset_to_customer"
+    assert result["changes"]["links"][0]["field_type"] == "BUSINESS_LOGO"
+
+
+def test_apply_link_asset_to_customer_builds_links():
+    cust_service = _FakeCustomerAssetService()
+    client = _FakeClient(
+        {
+            "AssetService": _FakePathService("assets"),
+            "CustomerAssetService": cust_service,
+        }
+    )
+    result = write._apply_link_asset_to_customer(
+        client,
+        "1234567890",
+        {
+            "links": [
+                {"asset_id": "555", "field_type": "BUSINESS_LOGO"},
+                {"asset_id": "666", "field_type": "MARKETING_IMAGE"},
+            ]
+        },
+    )
+    assert result["linked_count"] == 2
+    op0 = cust_service.operations[0].create
+    assert op0.asset.endswith("assets/555")
+    assert op0.field_type == client.enums.AssetFieldTypeEnum.BUSINESS_LOGO

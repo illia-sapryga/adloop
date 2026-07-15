@@ -2409,6 +2409,95 @@ def update_callout(
     )
 
 
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_location_asset(
+    business_profile_account_id: str,
+    asset_set_name: str = "",
+    campaign_id: str = "",
+    label_filters: _StrListOpt = None,
+    listing_id_filters: _StrListOpt = None,
+    customer_id: str = "",
+) -> dict:
+    """Draft a Google Business Profile location AssetSet — returns a PREVIEW.
+
+    Creates a LOCATION_SYNC AssetSet that pulls locations from a linked Google
+    Business Profile and links it at customer scope (or to one campaign when
+    campaign_id is set). The GBP must already be linked in Google Ads → Tools
+    → Linked accounts → Business Profile.
+
+    business_profile_account_id: numeric GBP/LBC account ID.
+    label_filters / listing_id_filters: optional filters to limit which GBP
+        locations sync.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_location_asset as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        business_profile_account_id=business_profile_account_id,
+        asset_set_name=asset_set_name,
+        campaign_id=campaign_id,
+        label_filters=label_filters,
+        listing_id_filters=listing_id_filters,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_business_name_asset(
+    business_name: str,
+    campaign_id: str = "",
+    customer_id: str = "",
+) -> dict:
+    """Draft a business-name asset — returns a PREVIEW.
+
+    Creates a TEXT asset linked as BUSINESS_NAME. Links at customer scope by
+    default, or to one campaign when campaign_id is set.
+
+    business_name: max 25 characters per Google Ads policy.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_business_name_asset as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        campaign_id=campaign_id,
+        business_name=business_name,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def link_asset_to_customer(
+    links: _DictList,
+    customer_id: str = "",
+) -> dict:
+    """Link EXISTING assets to the customer/account level — returns a PREVIEW.
+
+    "Promotes" assets that already exist (typically on legacy campaigns) so
+    they apply account-wide. Does NOT create new Asset rows — only CustomerAsset
+    link rows. Find candidate asset_ids via: SELECT asset.id, asset.type,
+    asset.name FROM asset.
+
+    links: list of dicts, each with asset_id (numeric str) and field_type
+        (AssetFieldType, e.g. BUSINESS_LOGO, MARKETING_IMAGE, SITELINK, CALL).
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import link_asset_to_customer as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        links=links,
+    )
+
+
 @mcp.tool(annotations=_DESTRUCTIVE, tags={"core"})
 @_safe
 def confirm_and_apply(
