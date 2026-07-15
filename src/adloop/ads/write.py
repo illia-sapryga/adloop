@@ -1817,6 +1817,251 @@ def draft_sitelinks(
 
 
 # ---------------------------------------------------------------------------
+# Call assets + ad schedule
+# ---------------------------------------------------------------------------
+
+# Pulled dynamically from the google-ads SDK so we don't drift when Google
+# adds new enum members in a future API version.
+from adloop.ads.enums import enum_names as _enum_names
+
+_COUNTRY_DIAL_CODES = {
+    "US": "+1", "CA": "+1", "GB": "+44", "DE": "+49", "FR": "+33",
+    "IT": "+39", "ES": "+34", "NL": "+31", "BE": "+32", "AT": "+43",
+    "CH": "+41", "AU": "+61", "NZ": "+64", "IE": "+353", "PT": "+351",
+}
+
+
+def _normalize_phone_e164(phone: str, country_code: str) -> tuple[str, str | None]:
+    """Return (normalized, error_or_None). Strips formatting, ensures + prefix.
+
+    Handles two trunk-prefix patterns:
+      - North America (US/CA): leading "1" before a 10-digit number is the
+        country code; strip it before re-adding "+1".
+      - European trunk "0": GB/DE/FR/IT/ES/NL/BE/AT/CH/IE/PT/AU/NZ all use a
+        leading "0" for domestic dialing that must be removed when adding
+        the international prefix.
+    """
+    raw = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+    if not raw:
+        return "", "phone_number is empty after stripping formatting"
+    if raw.startswith("+"):
+        return raw, None
+    dial = _COUNTRY_DIAL_CODES.get(country_code.upper())
+    if not dial:
+        return "", (
+            f"country_code '{country_code}' is not in the dial-code map; "
+            f"pass phone in E.164 form (with leading '+')"
+        )
+    cc_upper = country_code.upper()
+    if cc_upper in ("US", "CA") and len(raw) == 11 and raw.startswith("1"):
+        raw = raw[1:]
+    elif cc_upper not in ("US", "CA") and raw.startswith("0"):
+        raw = raw.lstrip("0")
+    return f"{dial}{raw}", None
+
+
+_VALID_DAYS_OF_WEEK = {
+    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY",
+    "SATURDAY", "SUNDAY",
+}
+_VALID_MINUTES = {0, 15, 30, 45}
+
+
+def _validate_ad_schedule(
+    schedule: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """Validate ad schedule entries. Returns (validated, errors).
+
+    Each entry: {day_of_week, start_hour, end_hour, start_minute=0, end_minute=0}.
+    Google Ads only accepts minutes in {0, 15, 30, 45}, hours in 0-24, and
+    requires end > start. Day-of-week strings are normalized to upper-case.
+    """
+    errors = []
+    validated = []
+    for i, entry in enumerate(schedule or []):
+        if not isinstance(entry, dict):
+            errors.append(f"ad_schedule[{i}]: must be a dict")
+            continue
+        day = str(entry.get("day_of_week", "")).strip().upper()
+        if day not in _VALID_DAYS_OF_WEEK:
+            errors.append(
+                f"ad_schedule[{i}]: day_of_week must be one of {sorted(_VALID_DAYS_OF_WEEK)}"
+            )
+            continue
+        try:
+            start_hour = int(entry.get("start_hour", -1))
+            end_hour = int(entry.get("end_hour", -1))
+            start_minute = int(entry.get("start_minute", 0))
+            end_minute = int(entry.get("end_minute", 0))
+        except (TypeError, ValueError):
+            errors.append(f"ad_schedule[{i}]: hour/minute values must be integers")
+            continue
+        if not (0 <= start_hour <= 23):
+            errors.append(f"ad_schedule[{i}]: start_hour must be in 0..23")
+        if not (0 <= end_hour <= 24):
+            errors.append(f"ad_schedule[{i}]: end_hour must be in 0..24")
+        if start_minute not in _VALID_MINUTES:
+            errors.append(
+                f"ad_schedule[{i}]: start_minute must be one of {sorted(_VALID_MINUTES)}"
+            )
+        if end_minute not in _VALID_MINUTES:
+            errors.append(
+                f"ad_schedule[{i}]: end_minute must be one of {sorted(_VALID_MINUTES)}"
+            )
+        if (end_hour, end_minute) <= (start_hour, start_minute):
+            errors.append(
+                f"ad_schedule[{i}]: end ({end_hour}:{end_minute:02d}) must be after "
+                f"start ({start_hour}:{start_minute:02d})"
+            )
+        validated.append({
+            "day_of_week": day,
+            "start_hour": start_hour,
+            "start_minute": start_minute,
+            "end_hour": end_hour,
+            "end_minute": end_minute,
+        })
+    return validated, errors
+
+
+def draft_call_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    phone_number: str = "",
+    country_code: str = "US",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    call_conversion_action_id: str = "",
+    ad_schedule: list[dict] | None = None,
+) -> dict:
+    """Draft a call asset (phone extension) — returns a PREVIEW.
+
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, the call asset attaches to that
+          ad group via ``AdGroupAsset``. Use this for per-service call
+          tracking inside a multi-ad-group campaign.
+        - Else if ``campaign_id`` is provided, the call asset attaches to
+          that campaign via ``CampaignAsset``.
+        - Else, the call asset attaches at the customer/account level via
+          ``CustomerAsset``.
+
+    phone_number: human or E.164 (e.g. "+15555550142" or "(555) 555-0142").
+    country_code: 2-letter ISO country code used to canonicalize a national
+        number to E.164. Ignored when phone_number already starts with '+'.
+    call_conversion_action_id: optional Google Ads conversion action ID to
+        count calls of qualifying duration (typically >=60 sec). When omitted,
+        the call asset uses the default account-level call-conversion settings.
+    ad_schedule: optional schedule dict list — see add_ad_schedule for shape
+        (day_of_week, start_hour/minute, end_hour/minute). Used to limit the
+        hours when the call extension shows.
+
+    Important: Google Ads requires manual phone-number verification before
+    the call asset can serve. The asset is created in the account but won't
+    show until verification completes in the Ads UI.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_call_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not phone_number:
+        return {"error": "phone_number is required"}
+
+    normalized_phone, phone_err = _normalize_phone_e164(phone_number, country_code)
+    if phone_err:
+        return {"error": phone_err}
+
+    schedule_validated, schedule_errors = _validate_ad_schedule(ad_schedule or [])
+    if schedule_errors:
+        return {"error": "Ad schedule validation failed", "details": schedule_errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+
+    warnings = [
+        "Google Ads requires phone-number verification before call assets serve. "
+        "Complete verification in Ads UI -> Tools -> Assets -> Calls."
+    ]
+
+    plan = ChangePlan(
+        operation="create_call_asset",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "phone_number": normalized_phone,
+            "country_code": country_code.upper(),
+            "call_conversion_action_id": call_conversion_action_id,
+            "ad_schedule": schedule_validated,
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    preview["warnings"] = warnings
+    return preview
+
+
+def add_ad_schedule(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_id: str = "",
+    schedule: list[dict] | None = None,
+) -> dict:
+    """Draft ad schedule additions for a campaign — returns a PREVIEW.
+
+    Creates ``CampaignCriterion`` records of type AD_SCHEDULE so the
+    campaign only serves during the specified hours/days.
+
+    schedule: list of dicts with keys:
+        - day_of_week: MONDAY..SUNDAY
+        - start_hour: 0..23
+        - end_hour: 0..24 (must be > start)
+        - start_minute / end_minute: 0, 15, 30, or 45 (default 0)
+
+    Note: ad-schedule hours follow the account's configured time zone.
+    Adding a schedule is additive — it does NOT replace existing schedule
+    criteria. Pause/remove existing schedule entries first if you want a
+    clean slate.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("add_ad_schedule", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not campaign_id:
+        return {"error": "campaign_id is required"}
+    validated, errors = _validate_ad_schedule(schedule or [])
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+    if not validated:
+        return {"error": "At least one schedule entry is required"}
+
+    plan = ChangePlan(
+        operation="add_ad_schedule",
+        entity_type="campaign_criterion",
+        entity_id=campaign_id,
+        customer_id=customer_id,
+        changes={
+            "campaign_id": campaign_id,
+            "schedule": validated,
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+# ---------------------------------------------------------------------------
 # confirm_and_apply — the only function that actually mutates Google Ads
 # ---------------------------------------------------------------------------
 
@@ -2692,6 +2937,8 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_structured_snippets": _apply_create_structured_snippets,
         "create_image_assets": _apply_create_image_assets,
         "create_sitelinks": _apply_create_sitelinks,
+        "create_call_asset": _apply_create_call_asset,
+        "add_ad_schedule": _apply_add_ad_schedule,
     }
 
     handler = dispatch.get(plan.operation)
@@ -3695,6 +3942,126 @@ def _apply_create_sitelinks(client: object, cid: str, changes: dict) -> dict:
         client.enums.AssetFieldTypeEnum.SITELINK,
         populate,
     )
+
+
+_AD_SCHEDULE_DAY_ENUM = {
+    "MONDAY": "MONDAY",
+    "TUESDAY": "TUESDAY",
+    "WEDNESDAY": "WEDNESDAY",
+    "THURSDAY": "THURSDAY",
+    "FRIDAY": "FRIDAY",
+    "SATURDAY": "SATURDAY",
+    "SUNDAY": "SUNDAY",
+}
+_MINUTE_TO_ENUM = {0: "ZERO", 15: "FIFTEEN", 30: "THIRTY", 45: "FORTY_FIVE"}
+
+
+def _populate_ad_schedule_info(client: object, info: object, entry: dict) -> None:
+    """Set fields on an AdScheduleInfo proto from a validated entry."""
+    info.day_of_week = getattr(
+        client.enums.DayOfWeekEnum, _AD_SCHEDULE_DAY_ENUM[entry["day_of_week"]]
+    )
+    info.start_hour = int(entry["start_hour"])
+    info.end_hour = int(entry["end_hour"])
+    info.start_minute = getattr(
+        client.enums.MinuteOfHourEnum, _MINUTE_TO_ENUM[int(entry["start_minute"])]
+    )
+    info.end_minute = getattr(
+        client.enums.MinuteOfHourEnum, _MINUTE_TO_ENUM[int(entry["end_minute"])]
+    )
+
+
+def _apply_add_ad_schedule(client: object, cid: str, changes: dict) -> dict:
+    """Add AdScheduleInfo CampaignCriterion records to a campaign."""
+    campaign_service = client.get_service("CampaignService")
+    crit_service = client.get_service("CampaignCriterionService")
+    operations = []
+    for entry in changes["schedule"]:
+        op = client.get_type("CampaignCriterionOperation")
+        crit = op.create
+        crit.campaign = campaign_service.campaign_path(
+            cid, changes["campaign_id"]
+        )
+        _populate_ad_schedule_info(client, crit.ad_schedule, entry)
+        operations.append(op)
+    response = crit_service.mutate_campaign_criteria(
+        customer_id=cid, operations=operations
+    )
+    return {
+        "campaign_criteria": [r.resource_name for r in response.results],
+    }
+
+
+def _apply_create_call_asset(client: object, cid: str, changes: dict) -> dict:
+    """Create a CallAsset at ad group, campaign, or customer scope."""
+    asset_service = client.get_service("AssetService")
+    googleads_service = client.get_service("GoogleAdsService")
+    operations = []
+
+    op = client.get_type("MutateOperation")
+    asset = op.asset_operation.create
+    asset.resource_name = asset_service.asset_path(cid, "-1")
+    asset.call_asset.country_code = changes["country_code"]
+    asset.call_asset.phone_number = changes["phone_number"]
+    if changes.get("call_conversion_action_id"):
+        ca_service = client.get_service("ConversionActionService")
+        asset.call_asset.call_conversion_action = ca_service.conversion_action_path(
+            cid, str(changes["call_conversion_action_id"])
+        )
+        asset.call_asset.call_conversion_reporting_state = (
+            client.enums.CallConversionReportingStateEnum.USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+        )
+    for entry in changes.get("ad_schedule") or []:
+        info = client.get_type("AdScheduleInfo")
+        _populate_ad_schedule_info(client, info, entry)
+        asset.call_asset.ad_schedule_targets.append(info)
+    operations.append(op)
+
+    scope = changes.get("scope", "campaign")
+    if scope == "ad_group":
+        if not changes.get("ad_group_id"):
+            raise ValueError("ad_group_id required for ad_group-scope call asset")
+        link_op = client.get_type("MutateOperation")
+        ag_asset = link_op.ad_group_asset_operation.create
+        ag_asset.asset = asset_service.asset_path(cid, "-1")
+        ag_asset.ad_group = googleads_service.ad_group_path(
+            cid, changes["ad_group_id"]
+        )
+        ag_asset.field_type = client.enums.AssetFieldTypeEnum.CALL
+        operations.append(link_op)
+    elif scope == "campaign":
+        if not changes.get("campaign_id"):
+            raise ValueError("campaign_id required for campaign-scope call asset")
+        link_op = client.get_type("MutateOperation")
+        ca = link_op.campaign_asset_operation.create
+        ca.asset = asset_service.asset_path(cid, "-1")
+        ca.campaign = googleads_service.campaign_path(cid, changes["campaign_id"])
+        ca.field_type = client.enums.AssetFieldTypeEnum.CALL
+        operations.append(link_op)
+    elif scope == "customer":
+        link_op = client.get_type("MutateOperation")
+        cust_asset = link_op.customer_asset_operation.create
+        cust_asset.asset = asset_service.asset_path(cid, "-1")
+        cust_asset.field_type = client.enums.AssetFieldTypeEnum.CALL
+        operations.append(link_op)
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+
+    response = googleads_service.mutate(
+        customer_id=cid, mutate_operations=operations
+    )
+
+    result = {"asset": "", "link": ""}
+    for resp in response.mutate_operation_responses:
+        if resp.asset_result.resource_name and not result["asset"]:
+            result["asset"] = resp.asset_result.resource_name
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            result["link"] = resp.ad_group_asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
+            result["link"] = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            result["link"] = resp.customer_asset_result.resource_name
+    return result
 
 
 def _apply_create_negative_keyword_list(

@@ -2046,6 +2046,80 @@ def draft_sitelinks(
     )
 
 
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_call_asset(
+    phone_number: str,
+    country_code: str = "US",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    call_conversion_action_id: str = "",
+    ad_schedule: _DictListOpt = None,
+    customer_id: str = "",
+) -> dict:
+    """Draft a call asset (phone extension) — returns a PREVIEW.
+
+    Scope (most-specific wins):
+      - ad_group_id set  → the call asset attaches to that ad group only.
+      - campaign_id set  → the call asset attaches at the campaign level.
+      - both empty       → the call asset attaches at the customer/account level.
+
+    phone_number: human or E.164 (e.g. "+15555550142" or "(555) 555-0142").
+    country_code: 2-letter ISO code used to canonicalize a national number to
+        E.164; ignored when phone_number already starts with '+'.
+    call_conversion_action_id: optional conversion action ID to count
+        qualifying calls at the resource level.
+    ad_schedule: optional list of {day_of_week, start_hour, end_hour,
+        start_minute, end_minute} entries limiting when the extension shows.
+
+    Google Ads requires manual phone-number verification before call assets
+    serve. Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_call_asset as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        phone_number=phone_number,
+        country_code=country_code,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        call_conversion_action_id=call_conversion_action_id,
+        ad_schedule=ad_schedule,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def add_ad_schedule(
+    campaign_id: str,
+    schedule: _DictList,
+    customer_id: str = "",
+) -> dict:
+    """Draft ad schedule additions for a campaign — returns a PREVIEW.
+
+    Creates AD_SCHEDULE CampaignCriterion records so the campaign only serves
+    during the given hours/days (in the account's time zone). Additive — it
+    does NOT replace existing schedule criteria.
+
+    schedule: list of dicts with keys:
+        - day_of_week: MONDAY..SUNDAY
+        - start_hour: 0..23
+        - end_hour: 0..24 (must be > start)
+        - start_minute / end_minute: 0, 15, 30, or 45 (default 0)
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import add_ad_schedule as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        campaign_id=campaign_id,
+        schedule=schedule,
+    )
+
+
 @mcp.tool(annotations=_DESTRUCTIVE, tags={"core"})
 @_safe
 def confirm_and_apply(
