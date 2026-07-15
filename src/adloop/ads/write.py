@@ -1834,18 +1834,26 @@ _COUNTRY_DIAL_CODES = {
 def _normalize_phone_e164(phone: str, country_code: str) -> tuple[str, str | None]:
     """Return (normalized, error_or_None). Strips formatting, ensures + prefix.
 
-    Handles two trunk-prefix patterns:
+    Handles trunk-prefix patterns:
+      - Already-E.164 ("+..."): returned unchanged.
+      - International access prefix "00": the digits after it already carry the
+        country code, so "0044 20..." -> "+44 20..." (country_code arg ignored).
       - North America (US/CA): leading "1" before a 10-digit number is the
         country code; strip it before re-adding "+1".
-      - European trunk "0": GB/DE/FR/IT/ES/NL/BE/AT/CH/IE/PT/AU/NZ all use a
-        leading "0" for domestic dialing that must be removed when adding
-        the international prefix.
+      - European trunk "0": GB/DE/FR/ES/NL/BE/AT/CH/IE/PT/AU/NZ drop exactly ONE
+        domestic trunk "0" when adding the international prefix. Italy (IT) is
+        the exception — it KEEPS its leading 0 in E.164 form, so it is not
+        stripped. Only a single trunk zero is removed, never every leading zero.
     """
     raw = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
     if not raw:
         return "", "phone_number is empty after stripping formatting"
     if raw.startswith("+"):
         return raw, None
+    # "00" is the international access prefix in most of the world; the digits
+    # that follow already include the country code, so convert straight to "+".
+    if raw.startswith("00"):
+        return "+" + raw[2:], None
     dial = _COUNTRY_DIAL_CODES.get(country_code.upper())
     if not dial:
         return "", (
@@ -1855,8 +1863,10 @@ def _normalize_phone_e164(phone: str, country_code: str) -> tuple[str, str | Non
     cc_upper = country_code.upper()
     if cc_upper in ("US", "CA") and len(raw) == 11 and raw.startswith("1"):
         raw = raw[1:]
-    elif cc_upper not in ("US", "CA") and raw.startswith("0"):
-        raw = raw.lstrip("0")
+    elif cc_upper not in ("US", "CA", "IT") and raw.startswith("0"):
+        # Strip exactly ONE domestic trunk "0" — not every leading zero.
+        # Italy keeps its leading 0 internationally, hence the IT exception.
+        raw = raw[1:]
     return f"{dial}{raw}", None
 
 

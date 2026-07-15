@@ -252,7 +252,24 @@ def test_normalize_phone_already_e164_passthrough():
 def test_normalize_phone_strips_european_trunk_zero():
     normalized, err = write._normalize_phone_e164("020 5550 0145", "GB")
     assert err is None
+    # exactly one trunk "0" removed (not every leading zero)
     assert normalized == "+442055500145"
+
+
+def test_normalize_phone_double_zero_international_prefix():
+    # "00" is the international access prefix; the following digits already
+    # carry the country code — must become "+44...", not "+44 00...".
+    normalized, err = write._normalize_phone_e164("0044 20 5550 0145", "GB")
+    assert err is None
+    assert normalized == "+442055500145"
+
+
+def test_normalize_phone_italy_keeps_leading_zero():
+    # Italy is the exception — the trunk "0" is part of the E.164 number and
+    # must NOT be stripped.
+    normalized, err = write._normalize_phone_e164("06 5550 0145", "IT")
+    assert err is None
+    assert normalized == "+390655500145"
 
 
 def test_normalize_phone_unknown_country_code_errors():
