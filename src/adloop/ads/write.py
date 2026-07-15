@@ -2626,6 +2626,299 @@ def draft_price_asset(
     return plan.to_preview()
 
 
+def update_structured_snippet(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str = "",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    header: str = "",
+    values: list[str] | None = None,
+) -> dict:
+    """Update a structured snippet via swap — returns a PREVIEW.
+
+    StructuredSnippetAsset fields (header + values) are immutable once created,
+    so "update" is a swap (same pattern as update_promotion):
+        1. Create a new StructuredSnippetAsset with the updated header/values.
+        2. Link the new asset at the same scope.
+        3. Unlink the old asset link.
+
+    The old Asset row stays in the account (orphaned) — Google reclaims it.
+
+    asset_id: numeric ID of the existing StructuredSnippetAsset to replace.
+
+    Scope (most-specific wins) — must match where the OLD asset is linked so
+    the swap unlinks the right link:
+        - ad_group_id provided  → AdGroupAsset.
+        - campaign_id provided  → CampaignAsset.
+        - both empty            → CustomerAsset (account-level).
+
+    header: official structured-snippet header (e.g. "Brands", "Services").
+    values: 3-10 values, each <= 25 chars.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_structured_snippet", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {
+            "error": "asset_id is required (the existing "
+            "StructuredSnippetAsset to replace)"
+        }
+
+    validated, errors = _validate_structured_snippets(
+        [{"header": header, "values": values or []}]
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+    warnings = [
+        "Update is a swap: a new StructuredSnippetAsset is created and "
+        "linked, the old link is unlinked. The old Asset row stays in the "
+        "account (orphaned) — Google Ads API does not support deleting "
+        "Asset rows."
+    ]
+
+    plan = ChangePlan(
+        operation="update_structured_snippet",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "old_asset_id": asset_id,
+            "snippet": validated[0],
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    preview["warnings"] = warnings
+    return preview
+
+
+# ---------------------------------------------------------------------------
+# In-place asset updates (call asset, sitelink, callout)
+# ---------------------------------------------------------------------------
+
+_VALID_CALL_REPORTING_STATES = _enum_names("CallConversionReportingStateEnum")
+
+
+def update_call_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str = "",
+    phone_number: str = "",
+    country_code: str = "",
+    call_conversion_action_id: str = "",
+    call_conversion_reporting_state: str = "",
+    ad_schedule: list[dict] | None = None,
+) -> dict:
+    """Update an existing CallAsset in place — returns a PREVIEW.
+
+    Use this to:
+      - re-point a CallAsset at a specific conversion action with
+        USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+      - change the phone number / country code
+      - replace the ad-schedule windows
+
+    Pass only the fields you want to change. Empty strings/None are treated as
+    "do not change".
+
+    asset_id: numeric ID of the existing call asset.
+    call_conversion_reporting_state: one of DISABLED |
+        USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION |
+        USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_call_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {"error": "asset_id is required"}
+
+    errors: list[str] = []
+    normalized_phone = ""
+    if phone_number:
+        cc = (country_code or "US").upper()
+        normalized_phone, phone_err = _normalize_phone_e164(phone_number, cc)
+        if phone_err:
+            errors.append(phone_err)
+
+    if call_conversion_reporting_state and (
+        call_conversion_reporting_state not in _VALID_CALL_REPORTING_STATES
+    ):
+        errors.append(
+            f"call_conversion_reporting_state '{call_conversion_reporting_state}'"
+            f" invalid; valid: {sorted(_VALID_CALL_REPORTING_STATES)}"
+        )
+
+    schedule_validated, schedule_errors = _validate_ad_schedule(ad_schedule or [])
+    errors.extend(schedule_errors)
+
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    changes: dict = {"asset_id": str(asset_id)}
+    if normalized_phone:
+        changes["phone_number"] = normalized_phone
+    if country_code:
+        changes["country_code"] = country_code.upper()
+    if call_conversion_action_id:
+        changes["call_conversion_action_id"] = str(call_conversion_action_id)
+    if call_conversion_reporting_state:
+        changes["call_conversion_reporting_state"] = call_conversion_reporting_state
+    if ad_schedule is not None:
+        changes["ad_schedule"] = schedule_validated
+
+    if len(changes) == 1:
+        return {"error": "No fields to update"}
+
+    plan = ChangePlan(
+        operation="update_call_asset",
+        entity_type="asset",
+        entity_id=str(asset_id),
+        customer_id=customer_id,
+        changes=changes,
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+def update_sitelink(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str = "",
+    link_text: str = "",
+    final_url: str = "",
+    description1: str = "",
+    description2: str = "",
+) -> dict:
+    """Update an existing SitelinkAsset in place — returns a PREVIEW.
+
+    Pass only the fields you want to change. Empty string = "do not change".
+
+    asset_id: numeric ID of the existing sitelink asset.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_sitelink", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {"error": "asset_id is required"}
+
+    errors: list[str] = []
+    if link_text and len(link_text) > 25:
+        errors.append(
+            f"link_text '{link_text}' is {len(link_text)} chars (max 25)"
+        )
+    if description1 and len(description1) > 35:
+        errors.append(
+            f"description1 is {len(description1)} chars (max 35)"
+        )
+    if description2 and len(description2) > 35:
+        errors.append(
+            f"description2 is {len(description2)} chars (max 35)"
+        )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    if final_url:
+        url_checks = _validate_urls([final_url])
+        url_err = url_checks.get(final_url)
+        if url_err:
+            return {
+                "error": "URL validation failed",
+                "details": [f"'{final_url}' is not reachable: {url_err}"],
+            }
+
+    changes: dict = {"asset_id": str(asset_id)}
+    if link_text:
+        changes["link_text"] = link_text
+    if final_url:
+        changes["final_url"] = final_url
+    if description1:
+        changes["description1"] = description1
+    if description2:
+        changes["description2"] = description2
+
+    if len(changes) == 1:
+        return {"error": "No fields to update"}
+
+    plan = ChangePlan(
+        operation="update_sitelink",
+        entity_type="asset",
+        entity_id=str(asset_id),
+        customer_id=customer_id,
+        changes=changes,
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+def update_callout(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str = "",
+    callout_text: str = "",
+) -> dict:
+    """Update an existing CalloutAsset's text in place — returns a PREVIEW.
+
+    asset_id: numeric ID of the existing callout asset.
+    callout_text: new callout text (max 25 chars).
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_callout", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {"error": "asset_id is required"}
+    text = (callout_text or "").strip()
+    if not text:
+        return {"error": "callout_text is required"}
+    if len(text) > 25:
+        return {
+            "error": "Validation failed",
+            "details": [f"callout_text is {len(text)} chars (max 25)"],
+        }
+
+    plan = ChangePlan(
+        operation="update_callout",
+        entity_type="asset",
+        entity_id=str(asset_id),
+        customer_id=customer_id,
+        changes={"asset_id": str(asset_id), "callout_text": text},
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
 # ---------------------------------------------------------------------------
 # confirm_and_apply — the only function that actually mutates Google Ads
 # ---------------------------------------------------------------------------
@@ -3507,6 +3800,10 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_promotion": _apply_create_promotion,
         "create_price_asset": _apply_create_price_asset,
         "update_promotion": _apply_update_promotion,
+        "update_structured_snippet": _apply_update_structured_snippet,
+        "update_call_asset": _apply_update_call_asset,
+        "update_sitelink": _apply_update_sitelink,
+        "update_callout": _apply_update_callout,
     }
 
     handler = dispatch.get(plan.operation)
@@ -4885,6 +5182,196 @@ def _apply_update_promotion(client: object, cid: str, changes: dict) -> dict:
         "new_link": new_link_resource,
         "old_link_removed": old_link_removed,
     }
+
+
+def _apply_update_structured_snippet(
+    client: object, cid: str, changes: dict
+) -> dict:
+    """Swap a StructuredSnippetAsset: create new + link, then unlink old.
+
+    Mirrors _apply_update_promotion but generalized to ad-group / campaign /
+    customer scope via _find_asset_link.
+    """
+    asset_service = client.get_service("AssetService")
+    googleads_service = client.get_service("GoogleAdsService")
+    campaign_service = client.get_service("CampaignService")
+
+    scope = changes.get("scope", "customer")
+    campaign_id = changes.get("campaign_id", "")
+    ad_group_id = changes.get("ad_group_id", "")
+    old_asset_id = str(changes["old_asset_id"])
+    snippet = changes["snippet"]
+    field_type = client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+
+    operations = []
+
+    # 1. Create the new Asset.
+    create_op = client.get_type("MutateOperation")
+    new_asset = create_op.asset_operation.create
+    new_asset.resource_name = asset_service.asset_path(cid, "-1")
+    new_asset.structured_snippet_asset.header = snippet["header"]
+    new_asset.structured_snippet_asset.values.extend(snippet["values"])
+    operations.append(create_op)
+
+    # 2. Link the new Asset at the same scope as the old one.
+    link_op = client.get_type("MutateOperation")
+    if scope == "ad_group":
+        if not ad_group_id:
+            raise ValueError("ad_group_id required for ad_group-scope update")
+        aga = link_op.ad_group_asset_operation.create
+        aga.asset = asset_service.asset_path(cid, "-1")
+        aga.ad_group = googleads_service.ad_group_path(cid, ad_group_id)
+        aga.field_type = field_type
+    elif scope == "campaign":
+        if not campaign_id:
+            raise ValueError("campaign_id required for campaign-scope update")
+        ca = link_op.campaign_asset_operation.create
+        ca.asset = asset_service.asset_path(cid, "-1")
+        ca.campaign = campaign_service.campaign_path(cid, campaign_id)
+        ca.field_type = field_type
+    elif scope == "customer":
+        cust = link_op.customer_asset_operation.create
+        cust.asset = asset_service.asset_path(cid, "-1")
+        cust.field_type = field_type
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+    operations.append(link_op)
+
+    response = googleads_service.mutate(
+        customer_id=cid, mutate_operations=operations
+    )
+
+    new_asset_resource = ""
+    new_link_resource = ""
+    for resp in response.mutate_operation_responses:
+        if resp.asset_result.resource_name and not new_asset_resource:
+            new_asset_resource = resp.asset_result.resource_name
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            new_link_resource = resp.ad_group_asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
+            new_link_resource = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            new_link_resource = resp.customer_asset_result.resource_name
+
+    # 3. Find and unlink the old link.
+    old_link_resource = _find_asset_link(
+        client,
+        cid,
+        old_asset_id,
+        "STRUCTURED_SNIPPET",
+        scope,
+        campaign_id,
+        ad_group_id,
+    )
+    old_link_removed = ""
+    if old_link_resource:
+        if scope == "ad_group":
+            svc = client.get_service("AdGroupAssetService")
+            rm_op = client.get_type("AdGroupAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_ad_group_assets(customer_id=cid, operations=[rm_op])
+        elif scope == "campaign":
+            svc = client.get_service("CampaignAssetService")
+            rm_op = client.get_type("CampaignAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_campaign_assets(customer_id=cid, operations=[rm_op])
+        else:
+            svc = client.get_service("CustomerAssetService")
+            rm_op = client.get_type("CustomerAssetOperation")
+            rm_op.remove = old_link_resource
+            svc.mutate_customer_assets(customer_id=cid, operations=[rm_op])
+        old_link_removed = old_link_resource
+
+    return {
+        "new_asset": new_asset_resource,
+        "new_link": new_link_resource,
+        "old_link_removed": old_link_removed,
+    }
+
+
+def _apply_update_call_asset(client: object, cid: str, changes: dict) -> dict:
+    """In-place update of an existing CallAsset."""
+    from google.protobuf import field_mask_pb2
+
+    asset_service = client.get_service("AssetService")
+    op = client.get_type("AssetOperation")
+    asset = op.update
+    asset.resource_name = asset_service.asset_path(cid, changes["asset_id"])
+
+    paths: list[str] = []
+    if "phone_number" in changes:
+        asset.call_asset.phone_number = changes["phone_number"]
+        paths.append("call_asset.phone_number")
+    if "country_code" in changes:
+        asset.call_asset.country_code = changes["country_code"]
+        paths.append("call_asset.country_code")
+    if "call_conversion_action_id" in changes:
+        ca_service = client.get_service("ConversionActionService")
+        asset.call_asset.call_conversion_action = ca_service.conversion_action_path(
+            cid, changes["call_conversion_action_id"]
+        )
+        paths.append("call_asset.call_conversion_action")
+    if "call_conversion_reporting_state" in changes:
+        asset.call_asset.call_conversion_reporting_state = getattr(
+            client.enums.CallConversionReportingStateEnum,
+            changes["call_conversion_reporting_state"],
+        )
+        paths.append("call_asset.call_conversion_reporting_state")
+    if "ad_schedule" in changes:
+        # Replace the schedule list entirely
+        for entry in changes["ad_schedule"]:
+            info = client.get_type("AdScheduleInfo")
+            _populate_ad_schedule_info(client, info, entry)
+            asset.call_asset.ad_schedule_targets.append(info)
+        paths.append("call_asset.ad_schedule_targets")
+
+    op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=paths))
+    response = asset_service.mutate_assets(customer_id=cid, operations=[op])
+    return {"resource_name": response.results[0].resource_name}
+
+
+def _apply_update_sitelink(client: object, cid: str, changes: dict) -> dict:
+    """In-place update of an existing SitelinkAsset."""
+    from google.protobuf import field_mask_pb2
+
+    asset_service = client.get_service("AssetService")
+    op = client.get_type("AssetOperation")
+    asset = op.update
+    asset.resource_name = asset_service.asset_path(cid, changes["asset_id"])
+
+    paths: list[str] = []
+    if "link_text" in changes:
+        asset.sitelink_asset.link_text = changes["link_text"]
+        paths.append("sitelink_asset.link_text")
+    if "description1" in changes:
+        asset.sitelink_asset.description1 = changes["description1"]
+        paths.append("sitelink_asset.description1")
+    if "description2" in changes:
+        asset.sitelink_asset.description2 = changes["description2"]
+        paths.append("sitelink_asset.description2")
+    if "final_url" in changes:
+        asset.final_urls.append(changes["final_url"])
+        paths.append("final_urls")
+
+    op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=paths))
+    response = asset_service.mutate_assets(customer_id=cid, operations=[op])
+    return {"resource_name": response.results[0].resource_name}
+
+
+def _apply_update_callout(client: object, cid: str, changes: dict) -> dict:
+    """In-place update of an existing CalloutAsset's text."""
+    from google.protobuf import field_mask_pb2
+
+    asset_service = client.get_service("AssetService")
+    op = client.get_type("AssetOperation")
+    asset = op.update
+    asset.resource_name = asset_service.asset_path(cid, changes["asset_id"])
+    asset.callout_asset.callout_text = changes["callout_text"]
+    op.update_mask.CopyFrom(field_mask_pb2.FieldMask(
+        paths=["callout_asset.callout_text"]
+    ))
+    response = asset_service.mutate_assets(customer_id=cid, operations=[op])
+    return {"resource_name": response.results[0].resource_name}
 
 
 def _apply_create_negative_keyword_list(

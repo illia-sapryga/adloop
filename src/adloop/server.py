@@ -2278,6 +2278,137 @@ def draft_price_asset(
     )
 
 
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def update_structured_snippet(
+    asset_id: str,
+    header: str,
+    values: _StrList,
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    customer_id: str = "",
+) -> dict:
+    """Update a structured snippet via swap — returns a PREVIEW.
+
+    StructuredSnippetAsset fields are immutable, so this creates a new asset
+    with the new header/values, links it at the same scope, and unlinks the
+    old one. Scope (most-specific wins): ad_group_id → campaign_id →
+    customer/account, and MUST match where the old asset is linked.
+
+    asset_id: numeric ID of the existing StructuredSnippetAsset to replace.
+    header: official structured-snippet header (e.g. "Brands", "Services").
+    values: 3-10 values, each <= 25 chars.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_structured_snippet as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        asset_id=asset_id,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        header=header,
+        values=values,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def update_call_asset(
+    asset_id: str,
+    phone_number: str = "",
+    country_code: str = "",
+    call_conversion_action_id: str = "",
+    call_conversion_reporting_state: str = "",
+    ad_schedule: _DictListOpt = None,
+    customer_id: str = "",
+) -> dict:
+    """Update an existing CallAsset in place — returns a PREVIEW.
+
+    Pass only the fields to change (empty string/None = leave unchanged). Use
+    this to re-point a call asset at a resource-level conversion action, change
+    the number, or replace the ad-schedule windows.
+
+    asset_id: numeric ID of the existing call asset.
+    call_conversion_reporting_state: DISABLED |
+        USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION |
+        USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_call_asset as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        asset_id=asset_id,
+        phone_number=phone_number,
+        country_code=country_code,
+        call_conversion_action_id=call_conversion_action_id,
+        call_conversion_reporting_state=call_conversion_reporting_state,
+        ad_schedule=ad_schedule,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def update_sitelink(
+    asset_id: str,
+    link_text: str = "",
+    final_url: str = "",
+    description1: str = "",
+    description2: str = "",
+    customer_id: str = "",
+) -> dict:
+    """Update an existing SitelinkAsset in place — returns a PREVIEW.
+
+    Pass only the fields to change (empty string = leave unchanged). A changed
+    final_url is validated for reachability.
+
+    asset_id: numeric ID of the existing sitelink asset.
+    link_text: max 25 chars. description1/description2: max 35 chars each.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_sitelink as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        asset_id=asset_id,
+        link_text=link_text,
+        final_url=final_url,
+        description1=description1,
+        description2=description2,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def update_callout(
+    asset_id: str,
+    callout_text: str,
+    customer_id: str = "",
+) -> dict:
+    """Update an existing CalloutAsset's text in place — returns a PREVIEW.
+
+    asset_id: numeric ID of the existing callout asset.
+    callout_text: new callout text (max 25 chars).
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_callout as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        asset_id=asset_id,
+        callout_text=callout_text,
+    )
+
+
 @mcp.tool(annotations=_DESTRUCTIVE, tags={"core"})
 @_safe
 def confirm_and_apply(

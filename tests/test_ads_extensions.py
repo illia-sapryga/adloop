@@ -785,3 +785,223 @@ def test_apply_create_price_asset_builds_offerings():
     )
     link = google_ads_service.operations[1].ad_group_asset_operation.create
     assert link.field_type == client.enums.AssetFieldTypeEnum.PRICE
+
+
+# ---------------------------------------------------------------------------
+# In-place update tools: callout / sitelink / call asset
+# ---------------------------------------------------------------------------
+
+
+def test_update_callout_requires_asset_id(config):
+    result = write.update_callout(config, customer_id="123-456-7890", callout_text="Hi")
+    assert result["error"] == "asset_id is required"
+
+
+def test_update_callout_rejects_long_text(config):
+    result = write.update_callout(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        callout_text="This callout text is definitely far too long",
+    )
+    assert result["error"] == "Validation failed"
+
+
+def test_update_callout_preview(config):
+    result = write.update_callout(
+        config, customer_id="123-456-7890", asset_id="55", callout_text="Free Wi-Fi"
+    )
+    assert result["operation"] == "update_callout"
+    assert result["changes"]["callout_text"] == "Free Wi-Fi"
+
+
+def test_apply_update_callout_sets_field_mask():
+    asset_service = _FakeAssetService()
+    client = _FakeClient({"AssetService": asset_service})
+    result = write._apply_update_callout(
+        client, "1234567890", {"asset_id": "55", "callout_text": "Free Wi-Fi"}
+    )
+    assert result["resource_name"].endswith("assets/0")
+    op = asset_service.operations[0]
+    assert op.update.callout_asset.callout_text == "Free Wi-Fi"
+    assert list(op.update_mask.paths) == ["callout_asset.callout_text"]
+
+
+def test_update_sitelink_rejects_empty_change(config):
+    result = write.update_sitelink(config, customer_id="123-456-7890", asset_id="55")
+    assert result["error"] == "No fields to update"
+
+
+def test_update_sitelink_preview(config, stub_urls):
+    result = write.update_sitelink(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        link_text="Pricing",
+        final_url="https://example.com/pricing",
+    )
+    assert result["operation"] == "update_sitelink"
+    assert result["changes"]["link_text"] == "Pricing"
+
+
+def test_apply_update_sitelink_partial_mask():
+    asset_service = _FakeAssetService()
+    client = _FakeClient({"AssetService": asset_service})
+    write._apply_update_sitelink(
+        client,
+        "1234567890",
+        {
+            "asset_id": "55",
+            "link_text": "Pricing",
+            "final_url": "https://example.com/pricing",
+        },
+    )
+    op = asset_service.operations[0]
+    assert op.update.sitelink_asset.link_text == "Pricing"
+    assert op.update.final_urls[0] == "https://example.com/pricing"
+    assert set(op.update_mask.paths) == {"sitelink_asset.link_text", "final_urls"}
+
+
+def test_update_call_asset_rejects_empty_change(config):
+    result = write.update_call_asset(config, customer_id="123-456-7890", asset_id="55")
+    assert result["error"] == "No fields to update"
+
+
+def test_update_call_asset_rejects_bad_reporting_state(config):
+    result = write.update_call_asset(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        call_conversion_reporting_state="NONSENSE",
+    )
+    assert result["error"] == "Validation failed"
+
+
+def test_update_call_asset_preview_normalizes_phone(config):
+    result = write.update_call_asset(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        phone_number="(555) 555-0142",
+        country_code="US",
+    )
+    assert result["changes"]["phone_number"] == "+15555550142"
+    assert result["changes"]["country_code"] == "US"
+
+
+def test_apply_update_call_asset_builds_field_mask():
+    asset_service = _FakeAssetService()
+    client = _FakeClient(
+        {
+            "AssetService": asset_service,
+            "ConversionActionService": _FakePathService("conversionActions"),
+        }
+    )
+    write._apply_update_call_asset(
+        client,
+        "1234567890",
+        {
+            "asset_id": "55",
+            "phone_number": "+15555550142",
+            "call_conversion_action_id": "999",
+            "call_conversion_reporting_state": "USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION",
+        },
+    )
+    op = asset_service.operations[0]
+    assert op.update.call_asset.phone_number == "+15555550142"
+    assert op.update.call_asset.call_conversion_action.endswith(
+        "conversionActions/999"
+    )
+    assert set(op.update_mask.paths) == {
+        "call_asset.phone_number",
+        "call_asset.call_conversion_action",
+        "call_asset.call_conversion_reporting_state",
+    }
+
+
+# ---------------------------------------------------------------------------
+# update_structured_snippet (swap)
+# ---------------------------------------------------------------------------
+
+
+def test_update_structured_snippet_requires_asset_id(config):
+    result = write.update_structured_snippet(
+        config,
+        customer_id="123-456-7890",
+        header="Brands",
+        values=["A", "B", "C"],
+    )
+    assert "asset_id is required" in result["error"]
+
+
+def test_update_structured_snippet_rejects_bad_header(config):
+    result = write.update_structured_snippet(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        header="Nope",
+        values=["A", "B", "C"],
+    )
+    assert result["error"] == "Validation failed"
+
+
+def test_update_structured_snippet_ad_group_scope_preview(config):
+    result = write.update_structured_snippet(
+        config,
+        customer_id="123-456-7890",
+        asset_id="55",
+        campaign_id="1001",
+        ad_group_id="2002",
+        header="Services",
+        values=["Repair", "Install", "Maintain"],
+    )
+    assert result["operation"] == "update_structured_snippet"
+    assert result["changes"]["scope"] == "ad_group"
+    assert result["changes"]["old_asset_id"] == "55"
+
+
+def test_apply_update_structured_snippet_swaps_ad_group_link():
+    responses = [
+        _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/9"),
+        _FakeMutateOperationResponse(
+            "ad_group_asset_result", "customers/1234567890/adGroupAssets/9"
+        ),
+    ]
+    google_ads_service = _FakeGoogleAdsService(responses)
+    google_ads_service.search_rows = [
+        SimpleNamespace(
+            ad_group_asset=SimpleNamespace(
+                resource_name="customers/1234567890/adGroupAssets/OLD"
+            )
+        )
+    ]
+    aga_service = _FakeLinkService("adGroupAssets")
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "AssetService": _FakePathService("assets"),
+            "CampaignService": _FakePathService("campaigns"),
+            "AdGroupAssetService": aga_service,
+        }
+    )
+
+    result = write._apply_update_structured_snippet(
+        client,
+        "1234567890",
+        {
+            "scope": "ad_group",
+            "campaign_id": "1001",
+            "ad_group_id": "2002",
+            "old_asset_id": "55",
+            "snippet": {"header": "Services", "values": ["Repair", "Install", "Maintain"]},
+        },
+    )
+    create = google_ads_service.operations[0].asset_operation.create
+    assert create.structured_snippet_asset.header == "Services"
+    assert list(create.structured_snippet_asset.values) == [
+        "Repair",
+        "Install",
+        "Maintain",
+    ]
+    assert result["old_link_removed"].endswith("adGroupAssets/OLD")
+    assert aga_service.operations[0].remove.endswith("adGroupAssets/OLD")
