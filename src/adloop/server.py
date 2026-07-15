@@ -1852,17 +1852,27 @@ def update_ad_group(
 @mcp.tool(annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_callouts(
-    campaign_id: str,
     callouts: _StrList,
+    campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
 ) -> dict:
-    """Draft campaign callout assets — returns a PREVIEW."""
+    """Draft callout assets — returns a PREVIEW.
+
+    Scope (most-specific wins):
+      - ad_group_id set  → the callouts link to that ad group only (use for
+        per-service callouts inside a multi-ad-group campaign).
+      - campaign_id set  → the callouts link at the campaign level.
+      - both empty       → the callouts link at the customer/account level and
+        apply to all eligible campaigns.
+    """
     from adloop.ads.write import draft_callouts as _impl
 
     return _impl(
         current_config(),
         customer_id=customer_id or current_config().ads.customer_id,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         callouts=callouts,
     )
 
@@ -1870,17 +1880,25 @@ def draft_callouts(
 @mcp.tool(annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_structured_snippets(
-    campaign_id: str,
     snippets: _DictList,
+    campaign_id: str = "",
+    ad_group_id: str = "",
     customer_id: str = "",
 ) -> dict:
-    """Draft campaign structured snippet assets — returns a PREVIEW."""
+    """Draft structured snippet assets — returns a PREVIEW.
+
+    Scope (most-specific wins):
+      - ad_group_id set  → snippets link to that ad group only.
+      - campaign_id set  → snippets link at the campaign level.
+      - both empty       → snippets link at the customer/account level.
+    """
     from adloop.ads.write import draft_structured_snippets as _impl
 
     return _impl(
         current_config(),
         customer_id=customer_id or current_config().ads.customer_id,
         campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         snippets=snippets,
     )
 

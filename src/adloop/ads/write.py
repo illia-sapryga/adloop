@@ -1548,14 +1548,43 @@ def update_campaign(
     return preview
 
 
+def _asset_scope(
+    ad_group_id: str, campaign_id: str, customer_id: str
+) -> tuple[str, str, str]:
+    """Resolve asset linkage scope using most-specific-wins precedence.
+
+    Returns ``(scope, entity_type, entity_id)`` for ChangePlan. Precedence:
+    ad_group > campaign > customer. CALLOUT, STRUCTURED_SNIPPET, PROMOTION,
+    PRICE, and CALL all support all three linkage levels per the Google Ads
+    API.
+    """
+    if ad_group_id:
+        return "ad_group", "ad_group_asset", ad_group_id
+    if campaign_id:
+        return "campaign", "campaign_asset", campaign_id
+    return "customer", "customer_asset", customer_id
+
+
 def draft_callouts(
     config: AdLoopConfig,
     *,
     customer_id: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     callouts: list[str] | None = None,
 ) -> dict:
-    """Draft campaign callout assets."""
+    """Draft callout assets — returns a PREVIEW.
+
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, the callouts link to that ad group
+          via ``AdGroupAsset``. Use this for per-service callouts inside a
+          multi-ad-group campaign so they don't bleed onto sibling ad groups.
+        - Else if ``campaign_id`` is provided, the callouts link at the
+          campaign level via ``CampaignAsset``.
+        - Else, the callouts link at the customer/account level via
+          ``CustomerAsset`` and become available to all eligible campaigns
+          automatically.
+    """
     from adloop.safety.guards import SafetyViolation, check_blocked_operation
     from adloop.safety.preview import ChangePlan, store_plan
 
@@ -1564,17 +1593,22 @@ def draft_callouts(
     except SafetyViolation as e:
         return {"error": str(e)}
 
-    validated_callouts, errors = _validate_callouts(campaign_id, callouts or [])
+    validated_callouts, errors = _validate_callouts(callouts or [])
     if errors:
         return {"error": "Validation failed", "details": errors}
 
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
     plan = ChangePlan(
         operation="create_callouts",
-        entity_type="campaign_asset",
-        entity_id=campaign_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
+            "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "callouts": validated_callouts,
         },
     )
@@ -1587,9 +1621,19 @@ def draft_structured_snippets(
     *,
     customer_id: str = "",
     campaign_id: str = "",
+    ad_group_id: str = "",
     snippets: list[dict] | None = None,
 ) -> dict:
-    """Draft campaign structured snippet assets."""
+    """Draft structured snippet assets — returns a PREVIEW.
+
+    Scope (most-specific wins):
+        - If ``ad_group_id`` is provided, snippets link to that ad group via
+          ``AdGroupAsset``.
+        - Else if ``campaign_id`` is provided, snippets attach at the campaign
+          level via ``CampaignAsset``.
+        - Else, snippets attach at the customer/account level and apply to all
+          eligible campaigns by default.
+    """
     from adloop.safety.guards import SafetyViolation, check_blocked_operation
     from adloop.safety.preview import ChangePlan, store_plan
 
@@ -1598,19 +1642,22 @@ def draft_structured_snippets(
     except SafetyViolation as e:
         return {"error": str(e)}
 
-    validated_snippets, errors = _validate_structured_snippets(
-        campaign_id, snippets or []
-    )
+    validated_snippets, errors = _validate_structured_snippets(snippets or [])
     if errors:
         return {"error": "Validation failed", "details": errors}
 
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
     plan = ChangePlan(
         operation="create_structured_snippets",
-        entity_type="campaign_asset",
-        entity_id=campaign_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
         customer_id=customer_id,
         changes={
+            "scope": scope,
             "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
             "snippets": validated_snippets,
         },
     )
@@ -2067,13 +2114,11 @@ def _ad_group_campaign_bidding_strategy(
 
 
 def _validate_callouts(
-    campaign_id: str, callouts: list[str]
+    callouts: list[str],
 ) -> tuple[list[str], list[str]]:
     errors = []
     validated = []
 
-    if not campaign_id:
-        errors.append("campaign_id is required")
     if not callouts:
         errors.append("At least one callout is required")
 
@@ -2092,13 +2137,11 @@ def _validate_callouts(
 
 
 def _validate_structured_snippets(
-    campaign_id: str, snippets: list[dict]
+    snippets: list[dict],
 ) -> tuple[list[dict], list[str]]:
     errors = []
     validated = []
 
-    if not campaign_id:
-        errors.append("campaign_id is required")
     if not snippets:
         errors.append("At least one structured snippet is required")
 
@@ -3458,7 +3501,41 @@ def _apply_campaign_assets(
     field_type: object,
     populate_asset: object,
 ) -> dict:
-    """Create assets and link them to a campaign via CampaignAsset."""
+    """Create assets and link them to a campaign via CampaignAsset (legacy alias)."""
+    return _apply_assets(
+        client,
+        cid,
+        assets,
+        field_type,
+        populate_asset,
+        scope="campaign",
+        campaign_id=campaign_id,
+    )
+
+
+def _apply_assets(
+    client: object,
+    cid: str,
+    assets: list[dict],
+    field_type: object,
+    populate_asset: object,
+    *,
+    scope: str = "campaign",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+) -> dict:
+    """Create Asset rows + link them at ad group, campaign, or customer scope.
+
+    scope:
+        - "ad_group" → AdGroupAsset (requires ad_group_id). Use for
+          per-service assets inside a multi-ad-group campaign so they don't
+          bleed onto sibling ad groups. CALLOUT, STRUCTURED_SNIPPET,
+          PROMOTION, PRICE, and CALL all support AdGroupAsset linking per the
+          Google Ads API.
+        - "campaign" → CampaignAsset (requires campaign_id)
+        - "customer" → CustomerAsset (account-level, applies to all eligible
+          campaigns by default)
+    """
     asset_service = client.get_service("AssetService")
     googleads_service = client.get_service("GoogleAdsService")
     operations = []
@@ -3470,69 +3547,108 @@ def _apply_campaign_assets(
         populate_asset(asset, payload)
         operations.append(op)
 
-    for i in range(len(assets)):
-        op = client.get_type("MutateOperation")
-        ca = op.campaign_asset_operation.create
-        ca.asset = asset_service.asset_path(cid, str(-(i + 1)))
-        ca.campaign = googleads_service.campaign_path(cid, campaign_id)
-        ca.field_type = field_type
-        operations.append(op)
+    if scope == "ad_group":
+        if not ad_group_id:
+            raise ValueError("ad_group_id required for ad_group-scope assets")
+        for i in range(len(assets)):
+            op = client.get_type("MutateOperation")
+            aga = op.ad_group_asset_operation.create
+            aga.asset = asset_service.asset_path(cid, str(-(i + 1)))
+            aga.ad_group = googleads_service.ad_group_path(cid, ad_group_id)
+            aga.field_type = field_type
+            operations.append(op)
+    elif scope == "campaign":
+        if not campaign_id:
+            raise ValueError("campaign_id is required for campaign-scope assets")
+        for i in range(len(assets)):
+            op = client.get_type("MutateOperation")
+            ca = op.campaign_asset_operation.create
+            ca.asset = asset_service.asset_path(cid, str(-(i + 1)))
+            ca.campaign = googleads_service.campaign_path(cid, campaign_id)
+            ca.field_type = field_type
+            operations.append(op)
+    elif scope == "customer":
+        for i in range(len(assets)):
+            op = client.get_type("MutateOperation")
+            cust_asset = op.customer_asset_operation.create
+            cust_asset.asset = asset_service.asset_path(cid, str(-(i + 1)))
+            cust_asset.field_type = field_type
+            operations.append(op)
+    else:
+        raise ValueError(f"Unknown asset scope: {scope}")
 
     response = googleads_service.mutate(
         customer_id=cid, mutate_operations=operations
     )
 
-    results = {"assets": [], "campaign_assets": []}
+    if scope == "ad_group":
+        results = {"assets": [], "ad_group_assets": []}
+        link_key = "ad_group_assets"
+    elif scope == "campaign":
+        results = {"assets": [], "campaign_assets": []}
+        link_key = "campaign_assets"
+    else:
+        results = {"assets": [], "customer_assets": []}
+        link_key = "customer_assets"
+
     num_assets = len(assets)
     for i, resp in enumerate(response.mutate_operation_responses):
         resource = None
         if resp.asset_result.resource_name:
             resource = resp.asset_result.resource_name
-        elif resp.campaign_asset_result.resource_name:
+        elif scope == "ad_group" and resp.ad_group_asset_result.resource_name:
+            resource = resp.ad_group_asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
             resource = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            resource = resp.customer_asset_result.resource_name
 
         if resource:
             if i < num_assets:
                 results["assets"].append(resource)
             else:
-                results["campaign_assets"].append(resource)
+                results[link_key].append(resource)
 
     return results
 
 
 def _apply_create_callouts(client: object, cid: str, changes: dict) -> dict:
-    """Create callout assets and link them to a campaign."""
+    """Create callout assets at ad group, campaign, or customer scope."""
 
     def populate(asset: object, payload: dict) -> None:
         asset.callout_asset.callout_text = payload["callout_text"]
 
     assets = [{"callout_text": text} for text in changes["callouts"]]
-    return _apply_campaign_assets(
+    return _apply_assets(
         client,
         cid,
-        changes["campaign_id"],
         assets,
         client.enums.AssetFieldTypeEnum.CALLOUT,
         populate,
+        scope=changes.get("scope", "campaign"),
+        campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
     )
 
 
 def _apply_create_structured_snippets(
     client: object, cid: str, changes: dict
 ) -> dict:
-    """Create structured snippet assets and link them to a campaign."""
+    """Create structured snippet assets at ad group, campaign, or customer scope."""
 
     def populate(asset: object, payload: dict) -> None:
         asset.structured_snippet_asset.header = payload["header"]
         asset.structured_snippet_asset.values.extend(payload["values"])
 
-    return _apply_campaign_assets(
+    return _apply_assets(
         client,
         cid,
-        changes["campaign_id"],
         changes["snippets"],
         client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET,
         populate,
+        scope=changes.get("scope", "campaign"),
+        campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
     )
 
 
