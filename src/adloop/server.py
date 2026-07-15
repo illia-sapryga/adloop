@@ -2120,6 +2120,164 @@ def add_ad_schedule(
     )
 
 
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_promotion(
+    promotion_target: str,
+    final_url: str,
+    money_off: float = 0,
+    percent_off: float = 0,
+    currency_code: str = "USD",
+    promotion_code: str = "",
+    orders_over_amount: float = 0,
+    occasion: str = "",
+    discount_modifier: str = "",
+    language_code: str = "en",
+    start_date: str = "",
+    end_date: str = "",
+    redemption_start_date: str = "",
+    redemption_end_date: str = "",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    ad_schedule: _DictListOpt = None,
+    customer_id: str = "",
+) -> dict:
+    """Draft a promotion extension asset — returns a PREVIEW.
+
+    Scope (most-specific wins): ad_group_id → campaign_id → customer/account.
+    Exactly one of money_off / percent_off is required.
+
+    promotion_target: label Google shows (max 20 chars).
+    final_url: reachable landing page (validated).
+    occasion / discount_modifier: optional Google enum tags.
+    promotion_code and orders_over_amount are mutually exclusive.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_promotion as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        promotion_target=promotion_target,
+        final_url=final_url,
+        money_off=money_off,
+        percent_off=percent_off,
+        currency_code=currency_code,
+        promotion_code=promotion_code,
+        orders_over_amount=orders_over_amount,
+        occasion=occasion,
+        discount_modifier=discount_modifier,
+        language_code=language_code,
+        start_date=start_date,
+        end_date=end_date,
+        redemption_start_date=redemption_start_date,
+        redemption_end_date=redemption_end_date,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        ad_schedule=ad_schedule,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def update_promotion(
+    asset_id: str,
+    promotion_target: str,
+    final_url: str,
+    money_off: float = 0,
+    percent_off: float = 0,
+    currency_code: str = "USD",
+    promotion_code: str = "",
+    orders_over_amount: float = 0,
+    occasion: str = "",
+    discount_modifier: str = "",
+    language_code: str = "en",
+    start_date: str = "",
+    end_date: str = "",
+    redemption_start_date: str = "",
+    redemption_end_date: str = "",
+    campaign_id: str = "",
+    ad_schedule: _DictListOpt = None,
+    customer_id: str = "",
+) -> dict:
+    """Update a promotion asset via swap — returns a PREVIEW.
+
+    PromotionAsset fields are immutable, so this creates a new asset with the
+    new values, links it at the same scope, and unlinks the old one. Pass
+    campaign_id for campaign scope; leave empty for customer/account scope.
+    The old Asset row stays in the account (orphaned) — Google reclaims it.
+
+    asset_id: numeric ID of the existing PromotionAsset to replace.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import update_promotion as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        asset_id=asset_id,
+        campaign_id=campaign_id,
+        promotion_target=promotion_target,
+        final_url=final_url,
+        money_off=money_off,
+        percent_off=percent_off,
+        currency_code=currency_code,
+        promotion_code=promotion_code,
+        orders_over_amount=orders_over_amount,
+        occasion=occasion,
+        discount_modifier=discount_modifier,
+        language_code=language_code,
+        start_date=start_date,
+        end_date=end_date,
+        redemption_start_date=redemption_start_date,
+        redemption_end_date=redemption_end_date,
+        ad_schedule=ad_schedule,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_price_asset(
+    offerings: _DictList,
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    price_type: str = "SERVICES",
+    price_qualifier: str = "FROM",
+    language_code: str = "en",
+    currency_code: str = "USD",
+    customer_id: str = "",
+) -> dict:
+    """Draft a price extension asset — returns a PREVIEW.
+
+    Scope (most-specific wins): ad_group_id → campaign_id → customer/account.
+    Google Ads requires 3-8 offerings.
+
+    offerings: list of 3-8 dicts, each with header (<=25), description (<=25),
+        price (> 0), final_url (reachable), optional final_mobile_url and unit.
+    price_type: SERVICES (default), BRANDS, EVENTS, etc.
+    price_qualifier: FROM (default), UP_TO, AVERAGE, or empty.
+
+    Every price MUST match the amount shown on its final_url page.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_price_asset as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        price_type=price_type,
+        price_qualifier=price_qualifier,
+        language_code=language_code,
+        currency_code=currency_code,
+        offerings=offerings,
+    )
+
+
 @mcp.tool(annotations=_DESTRUCTIVE, tags={"core"})
 @_safe
 def confirm_and_apply(

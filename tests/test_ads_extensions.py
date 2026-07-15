@@ -478,3 +478,310 @@ def test_apply_add_ad_schedule_builds_criteria():
     crit = crit_service.operations[0].create
     assert crit.ad_schedule.day_of_week == client.enums.DayOfWeekEnum.MONDAY
     assert crit.ad_schedule.start_hour == 9
+
+
+# ---------------------------------------------------------------------------
+# draft_promotion
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stub_urls(monkeypatch):
+    monkeypatch.setattr(
+        "adloop.ads.write._validate_urls",
+        lambda urls, timeout=10: {u: None for u in urls},
+    )
+
+
+def test_draft_promotion_requires_one_discount(config, stub_urls):
+    result = write.draft_promotion(
+        config,
+        customer_id="123-456-7890",
+        promotion_target="Spring Sale",
+        final_url="https://example.com/promo",
+        campaign_id="1001",
+    )
+    assert result["error"] == "Validation failed"
+    assert any("money_off or percent_off" in d for d in result["details"])
+
+
+def test_draft_promotion_rejects_both_discounts(config, stub_urls):
+    result = write.draft_promotion(
+        config,
+        customer_id="123-456-7890",
+        promotion_target="Spring Sale",
+        final_url="https://example.com/promo",
+        money_off=10,
+        percent_off=15,
+        campaign_id="1001",
+    )
+    assert result["error"] == "Validation failed"
+    assert any("not both" in d for d in result["details"])
+
+
+def test_draft_promotion_rejects_long_target(config, stub_urls):
+    result = write.draft_promotion(
+        config,
+        customer_id="123-456-7890",
+        promotion_target="This target is far too long for a promo",
+        final_url="https://example.com/promo",
+        percent_off=20,
+        campaign_id="1001",
+    )
+    assert result["error"] == "Validation failed"
+    assert any("max 20" in d for d in result["details"])
+
+
+def test_draft_promotion_rejects_code_and_orders_over(config, stub_urls):
+    result = write.draft_promotion(
+        config,
+        customer_id="123-456-7890",
+        promotion_target="Spring Sale",
+        final_url="https://example.com/promo",
+        percent_off=20,
+        promotion_code="SAVE20",
+        orders_over_amount=50,
+        campaign_id="1001",
+    )
+    assert result["error"] == "Validation failed"
+    assert any("mutually exclusive" in d for d in result["details"])
+
+
+def test_draft_promotion_ad_group_scope(config, stub_urls):
+    result = write.draft_promotion(
+        config,
+        customer_id="123-456-7890",
+        promotion_target="Spring Sale",
+        final_url="https://example.com/promo",
+        percent_off=20,
+        campaign_id="1001",
+        ad_group_id="2002",
+    )
+    assert result["operation"] == "create_promotion"
+    assert result["changes"]["scope"] == "ad_group"
+    assert result["changes"]["promotion"]["percent_off"] == 20.0
+
+
+def test_apply_create_promotion_money_off_campaign_scope():
+    responses = [
+        _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/1"),
+        _FakeMutateOperationResponse(
+            "campaign_asset_result", "customers/1234567890/campaignAssets/1"
+        ),
+    ]
+    google_ads_service, client = _asset_link_client(responses)
+
+    write._apply_create_promotion(
+        client,
+        "1234567890",
+        {
+            "scope": "campaign",
+            "campaign_id": "1001",
+            "ad_group_id": "",
+            "promotion": {
+                "promotion_target": "Spring Sale",
+                "final_url": "https://example.com/promo",
+                "currency_code": "USD",
+                "money_off": 25.0,
+                "percent_off": 0.0,
+                "promotion_code": "",
+                "orders_over_amount": 0.0,
+                "occasion": "",
+                "discount_modifier": "",
+                "language_code": "en",
+                "start_date": "",
+                "end_date": "",
+                "redemption_start_date": "",
+                "redemption_end_date": "",
+                "ad_schedule": [],
+            },
+        },
+    )
+    create = google_ads_service.operations[0].asset_operation.create
+    assert create.promotion_asset.promotion_target == "Spring Sale"
+    assert create.promotion_asset.money_amount_off.amount_micros == 25_000_000
+    assert create.final_urls[0] == "https://example.com/promo"
+    link = google_ads_service.operations[1].campaign_asset_operation.create
+    assert link.field_type == client.enums.AssetFieldTypeEnum.PROMOTION
+
+
+def test_apply_update_promotion_swaps_and_unlinks_old():
+    responses = [
+        _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/9"),
+        _FakeMutateOperationResponse(
+            "campaign_asset_result", "customers/1234567890/campaignAssets/9"
+        ),
+    ]
+    google_ads_service = _FakeGoogleAdsService(responses)
+    google_ads_service.search_rows = [
+        SimpleNamespace(
+            campaign_asset=SimpleNamespace(
+                resource_name="customers/1234567890/campaignAssets/OLD"
+            )
+        )
+    ]
+    ca_link_service = _FakeLinkService("campaignAssets")
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "AssetService": _FakePathService("assets"),
+            "CampaignService": _FakePathService("campaigns"),
+            "CampaignAssetService": ca_link_service,
+        }
+    )
+
+    result = write._apply_update_promotion(
+        client,
+        "1234567890",
+        {
+            "scope": "campaign",
+            "campaign_id": "1001",
+            "old_asset_id": "555",
+            "promotion": {
+                "promotion_target": "Summer Sale",
+                "final_url": "https://example.com/promo",
+                "currency_code": "USD",
+                "money_off": 0.0,
+                "percent_off": 30.0,
+                "promotion_code": "",
+                "orders_over_amount": 0.0,
+                "occasion": "",
+                "discount_modifier": "",
+                "language_code": "en",
+                "start_date": "",
+                "end_date": "",
+                "redemption_start_date": "",
+                "redemption_end_date": "",
+                "ad_schedule": [],
+            },
+        },
+    )
+    assert result["new_asset"].endswith("assets/9")
+    assert result["old_link_removed"].endswith("campaignAssets/OLD")
+    assert ca_link_service.operations[0].remove.endswith("campaignAssets/OLD")
+
+
+# ---------------------------------------------------------------------------
+# draft_price_asset
+# ---------------------------------------------------------------------------
+
+
+def _offerings(n=3):
+    return [
+        {
+            "header": f"Service {i}",
+            "description": f"Desc {i}",
+            "price": 100 + i,
+            "final_url": f"https://example.com/service-{i}",
+        }
+        for i in range(n)
+    ]
+
+
+def test_draft_price_asset_requires_three_offerings(config, stub_urls):
+    result = write.draft_price_asset(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        offerings=_offerings(2),
+    )
+    assert result["error"] == "Validation failed"
+    assert any("between 3 and 8" in d for d in result["details"])
+
+
+def test_draft_price_asset_rejects_duplicate_headers(config, stub_urls):
+    rows = _offerings(3)
+    rows[1]["header"] = rows[0]["header"]
+    result = write.draft_price_asset(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        offerings=rows,
+    )
+    assert result["error"] == "Validation failed"
+    assert any("duplicate header" in d for d in result["details"])
+
+
+def test_draft_price_asset_rejects_bad_type(config, stub_urls):
+    result = write.draft_price_asset(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        price_type="NOPE",
+        offerings=_offerings(3),
+    )
+    assert result["error"] == "Validation failed"
+    assert any("price_type" in d for d in result["details"])
+
+
+def test_draft_price_asset_customer_scope(config, stub_urls):
+    result = write.draft_price_asset(
+        config,
+        customer_id="123-456-7890",
+        offerings=_offerings(3),
+    )
+    assert result["operation"] == "create_price_asset"
+    assert result["changes"]["scope"] == "customer"
+    assert len(result["changes"]["price"]["offerings"]) == 3
+
+
+def test_apply_create_price_asset_builds_offerings():
+    responses = [
+        _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/1"),
+        _FakeMutateOperationResponse(
+            "ad_group_asset_result", "customers/1234567890/adGroupAssets/1"
+        ),
+    ]
+    google_ads_service, client = _asset_link_client(responses)
+
+    write._apply_create_price_asset(
+        client,
+        "1234567890",
+        {
+            "scope": "ad_group",
+            "campaign_id": "",
+            "ad_group_id": "2002",
+            "price": {
+                "price_type": "SERVICES",
+                "price_qualifier": "FROM",
+                "language_code": "en",
+                "currency_code": "USD",
+                "offerings": [
+                    {
+                        "header": "Service A",
+                        "description": "Desc A",
+                        "price": 149.0,
+                        "final_url": "https://example.com/a",
+                        "final_mobile_url": "",
+                        "unit": "",
+                    },
+                    {
+                        "header": "Service B",
+                        "description": "Desc B",
+                        "price": 199.0,
+                        "final_url": "https://example.com/b",
+                        "final_mobile_url": "",
+                        "unit": "PER_HOUR",
+                    },
+                    {
+                        "header": "Service C",
+                        "description": "Desc C",
+                        "price": 249.0,
+                        "final_url": "https://example.com/c",
+                        "final_mobile_url": "",
+                        "unit": "",
+                    },
+                ],
+            },
+        },
+    )
+    create = google_ads_service.operations[0].asset_operation.create
+    assert create.price_asset.type_ == client.enums.PriceExtensionTypeEnum.SERVICES
+    assert len(create.price_asset.price_offerings) == 3
+    assert create.price_asset.price_offerings[0].price.amount_micros == 149_000_000
+    assert (
+        create.price_asset.price_offerings[1].unit
+        == client.enums.PriceExtensionPriceUnitEnum.PER_HOUR
+    )
+    link = google_ads_service.operations[1].ad_group_asset_operation.create
+    assert link.field_type == client.enums.AssetFieldTypeEnum.PRICE

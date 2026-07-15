@@ -2062,6 +2062,571 @@ def add_ad_schedule(
 
 
 # ---------------------------------------------------------------------------
+# Promotion assets
+# ---------------------------------------------------------------------------
+
+_VALID_PROMOTION_OCCASIONS = _enum_names("PromotionExtensionOccasionEnum")
+_VALID_DISCOUNT_MODIFIERS = _enum_names("PromotionExtensionDiscountModifierEnum")
+
+
+def _is_valid_iso_date(value: str) -> bool:
+    """True if value parses as a YYYY-MM-DD calendar date."""
+    from datetime import datetime
+
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_promotion_inputs(
+    *,
+    promotion_target: str,
+    final_url: str,
+    money_off: float,
+    percent_off: float,
+    currency_code: str,
+    promotion_code: str,
+    orders_over_amount: float,
+    occasion: str,
+    discount_modifier: str,
+    language_code: str,
+    start_date: str,
+    end_date: str,
+    redemption_start_date: str,
+    redemption_end_date: str,
+    ad_schedule: list[dict] | None,
+) -> tuple[dict, list[str]]:
+    """Validate every PromotionAsset field. Returns (normalized, errors)."""
+    errors: list[str] = []
+    target = (promotion_target or "").strip()
+    url = (final_url or "").strip()
+
+    if not target:
+        errors.append("promotion_target is required")
+    elif len(target) > 20:
+        errors.append(
+            f"promotion_target '{target}' is {len(target)} chars (max 20)"
+        )
+
+    if not url:
+        errors.append("final_url is required")
+
+    has_money = money_off and money_off > 0
+    has_percent = percent_off and percent_off > 0
+    if has_money and has_percent:
+        errors.append(
+            "Specify exactly one of money_off or percent_off, not both"
+        )
+    elif not has_money and not has_percent:
+        errors.append(
+            "One of money_off or percent_off is required (must be > 0)"
+        )
+
+    if has_percent and (percent_off <= 0 or percent_off > 100):
+        errors.append(f"percent_off must be in (0, 100]; got {percent_off}")
+
+    code = (promotion_code or "").strip()
+    if code and len(code) > 15:
+        errors.append(
+            f"promotion_code '{code}' is {len(code)} chars (max 15)"
+        )
+
+    has_orders_over = bool(orders_over_amount and orders_over_amount > 0)
+    if code and has_orders_over:
+        errors.append(
+            "promotion_code and orders_over_amount are mutually exclusive "
+            "(Google Ads PromotionAsset.promotion_trigger is a oneof) — "
+            "specify exactly one"
+        )
+
+    occ = (occasion or "").strip().upper()
+    if occ and occ not in _VALID_PROMOTION_OCCASIONS:
+        errors.append(
+            f"occasion '{occ}' invalid; valid values: "
+            f"{sorted(_VALID_PROMOTION_OCCASIONS)}"
+        )
+
+    modifier = (discount_modifier or "").strip().upper()
+    if modifier and modifier not in _VALID_DISCOUNT_MODIFIERS:
+        errors.append(
+            f"discount_modifier '{modifier}' invalid; valid: "
+            f"{sorted(_VALID_DISCOUNT_MODIFIERS)} (or empty for none)"
+        )
+
+    for label, value in (
+        ("start_date", start_date),
+        ("end_date", end_date),
+        ("redemption_start_date", redemption_start_date),
+        ("redemption_end_date", redemption_end_date),
+    ):
+        if value and not _is_valid_iso_date(value):
+            errors.append(f"{label} '{value}' must be YYYY-MM-DD")
+
+    schedule_validated, schedule_errors = _validate_ad_schedule(ad_schedule or [])
+    errors.extend(schedule_errors)
+
+    if errors:
+        return {}, errors
+
+    if url:
+        url_checks = _validate_urls([url])
+        url_err = url_checks.get(url)
+        if url_err:
+            errors.append(f"final_url '{url}' is not reachable: {url_err}")
+            return {}, errors
+
+    normalized: dict = {
+        "promotion_target": target,
+        "final_url": url,
+        "currency_code": (currency_code or "USD").upper(),
+        "promotion_code": code,
+        "orders_over_amount": float(orders_over_amount or 0),
+        "occasion": occ,
+        "discount_modifier": modifier,
+        "language_code": (language_code or "en").lower(),
+        "start_date": start_date or "",
+        "end_date": end_date or "",
+        "redemption_start_date": redemption_start_date or "",
+        "redemption_end_date": redemption_end_date or "",
+        "ad_schedule": schedule_validated,
+    }
+    if has_money:
+        normalized["money_off"] = float(money_off)
+        normalized["percent_off"] = 0.0
+    else:
+        normalized["money_off"] = 0.0
+        normalized["percent_off"] = float(percent_off)
+
+    return normalized, []
+
+
+def draft_promotion(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    promotion_target: str = "",
+    final_url: str = "",
+    money_off: float = 0,
+    percent_off: float = 0,
+    currency_code: str = "USD",
+    promotion_code: str = "",
+    orders_over_amount: float = 0,
+    occasion: str = "",
+    discount_modifier: str = "",
+    language_code: str = "en",
+    start_date: str = "",
+    end_date: str = "",
+    redemption_start_date: str = "",
+    redemption_end_date: str = "",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    ad_schedule: list[dict] | None = None,
+) -> dict:
+    """Draft a promotion extension asset — returns a PREVIEW.
+
+    Creates a PromotionAsset and links it at ad group, campaign, or customer
+    scope. Exactly one of money_off / percent_off must be provided.
+
+    Scope (most-specific wins):
+        - ad_group_id provided  → AdGroupAsset link (per-service promo inside
+          a multi-ad-group campaign).
+        - campaign_id provided  → CampaignAsset link.
+        - both empty            → CustomerAsset link (account-level).
+
+    Required:
+        promotion_target: what the promotion is for, e.g. "Spring Sale"
+            (max 20 chars; this is the label Google shows in the ad).
+        final_url: landing page for the promotion (must return 2xx/3xx).
+        money_off OR percent_off: the discount amount.
+
+    Optional:
+        currency_code: ISO 4217 (default USD). Used for money_off and
+            orders_over_amount.
+        promotion_code: optional coupon code (max 15 chars).
+        orders_over_amount: minimum order amount that unlocks the promo.
+        occasion: optional event tag — e.g. BLACK_FRIDAY, SUMMER_SALE.
+        discount_modifier: optional modifier; "UP_TO" surfaces as
+            "Up to $X off" instead of "$X off".
+        language_code: BCP-47 (default "en").
+        start_date / end_date: YYYY-MM-DD. Leave blank for always-on.
+        redemption_start_date / redemption_end_date: YYYY-MM-DD.
+        ad_schedule: optional list of {day_of_week, start_hour, end_hour,
+            start_minute, end_minute} entries restricting when the promo shows.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_promotion", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    normalized, errors = _validate_promotion_inputs(
+        promotion_target=promotion_target,
+        final_url=final_url,
+        money_off=money_off,
+        percent_off=percent_off,
+        currency_code=currency_code,
+        promotion_code=promotion_code,
+        orders_over_amount=orders_over_amount,
+        occasion=occasion,
+        discount_modifier=discount_modifier,
+        language_code=language_code,
+        start_date=start_date,
+        end_date=end_date,
+        redemption_start_date=redemption_start_date,
+        redemption_end_date=redemption_end_date,
+        ad_schedule=ad_schedule,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+    plan = ChangePlan(
+        operation="create_promotion",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "promotion": normalized,
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+def update_promotion(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    asset_id: str = "",
+    campaign_id: str = "",
+    promotion_target: str = "",
+    final_url: str = "",
+    money_off: float = 0,
+    percent_off: float = 0,
+    currency_code: str = "USD",
+    promotion_code: str = "",
+    orders_over_amount: float = 0,
+    occasion: str = "",
+    discount_modifier: str = "",
+    language_code: str = "en",
+    start_date: str = "",
+    end_date: str = "",
+    redemption_start_date: str = "",
+    redemption_end_date: str = "",
+    ad_schedule: list[dict] | None = None,
+) -> dict:
+    """Update a promotion via swap — returns a PREVIEW.
+
+    PromotionAsset fields are immutable once created in the Google Ads API, so
+    "update" is implemented as a swap:
+        1. Create a new PromotionAsset with the updated values.
+        2. Link the new asset at the same scope.
+        3. Unlink the old asset.
+
+    The old Asset row itself stays in the account (orphaned). The Ads API does
+    not support hard-deleting Asset rows; Google reclaims orphaned assets in
+    due course.
+
+    asset_id: numeric ID of the existing PromotionAsset to replace.
+    campaign_id: pass to scope BOTH the new and old links to that campaign.
+        Leave empty for customer/account-level scope.
+
+    All other fields: see draft_promotion docstring.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("update_promotion", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    if not asset_id:
+        return {"error": "asset_id is required (the existing PromotionAsset to replace)"}
+
+    normalized, errors = _validate_promotion_inputs(
+        promotion_target=promotion_target,
+        final_url=final_url,
+        money_off=money_off,
+        percent_off=percent_off,
+        currency_code=currency_code,
+        promotion_code=promotion_code,
+        orders_over_amount=orders_over_amount,
+        occasion=occasion,
+        discount_modifier=discount_modifier,
+        language_code=language_code,
+        start_date=start_date,
+        end_date=end_date,
+        redemption_start_date=redemption_start_date,
+        redemption_end_date=redemption_end_date,
+        ad_schedule=ad_schedule,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope = "campaign" if campaign_id else "customer"
+    warnings = [
+        "Update is a swap: a new PromotionAsset is created and linked, "
+        "the old link is unlinked. The old Asset row stays in the account "
+        "(orphaned) — Google Ads API does not support deleting Asset rows."
+    ]
+
+    plan = ChangePlan(
+        operation="update_promotion",
+        entity_type="campaign_asset" if scope == "campaign" else "customer_asset",
+        entity_id=campaign_id or customer_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "old_asset_id": asset_id,
+            "promotion": normalized,
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    preview["warnings"] = warnings
+    return preview
+
+
+# ---------------------------------------------------------------------------
+# Price assets
+# ---------------------------------------------------------------------------
+
+_VALID_PRICE_TYPES = _enum_names("PriceExtensionTypeEnum")
+_VALID_PRICE_QUALIFIERS = _enum_names("PriceExtensionPriceQualifierEnum")
+_VALID_PRICE_UNITS = _enum_names("PriceExtensionPriceUnitEnum")
+
+# Google Ads requires between 3 and 8 price offerings per price asset.
+_PRICE_OFFERING_MIN = 3
+_PRICE_OFFERING_MAX = 8
+# Header and description are each capped at 25 characters by Google.
+_PRICE_TEXT_MAX = 25
+
+
+def _validate_price_inputs(
+    *,
+    price_type: str,
+    price_qualifier: str,
+    language_code: str,
+    currency_code: str,
+    offerings: list[dict] | None,
+) -> tuple[dict, list[str]]:
+    """Validate every PriceAsset field. Returns (normalized, errors).
+
+    A price asset needs a type (e.g. SERVICES), an optional FROM/UP_TO/AVERAGE
+    qualifier, and 3-8 price offerings. Each offering needs a header (<=25),
+    a description (<=25), a price amount (> 0), and a reachable final_url.
+    """
+    errors: list[str] = []
+
+    ptype = (price_type or "").strip().upper()
+    if not ptype:
+        errors.append("price_type is required (e.g. SERVICES, BRANDS, EVENTS)")
+    elif ptype not in _VALID_PRICE_TYPES:
+        errors.append(
+            f"price_type '{ptype}' invalid; valid values: "
+            f"{sorted(_VALID_PRICE_TYPES)}"
+        )
+
+    qualifier = (price_qualifier or "").strip().upper()
+    if qualifier and qualifier not in _VALID_PRICE_QUALIFIERS:
+        errors.append(
+            f"price_qualifier '{qualifier}' invalid; valid: "
+            f"{sorted(_VALID_PRICE_QUALIFIERS)} (or empty for none)"
+        )
+
+    rows = offerings or []
+    if not (_PRICE_OFFERING_MIN <= len(rows) <= _PRICE_OFFERING_MAX):
+        errors.append(
+            f"price asset needs between {_PRICE_OFFERING_MIN} and "
+            f"{_PRICE_OFFERING_MAX} offerings; got {len(rows)}"
+        )
+
+    normalized_offerings: list[dict] = []
+    seen_headers: set[str] = set()
+    urls_to_check: list[str] = []
+    for i, row in enumerate(rows):
+        label = f"offering[{i}]"
+        header = str(row.get("header", "")).strip()
+        description = str(row.get("description", "")).strip()
+        url = str(row.get("final_url", "")).strip()
+        mobile_url = str(row.get("final_mobile_url", "")).strip()
+        unit = str(row.get("unit", "")).strip().upper()
+
+        if not header:
+            errors.append(f"{label}: header is required")
+        elif len(header) > _PRICE_TEXT_MAX:
+            errors.append(
+                f"{label}: header '{header}' is {len(header)} chars "
+                f"(max {_PRICE_TEXT_MAX})"
+            )
+        # Google rejects a price asset with two identical offering headers.
+        key = header.lower()
+        if key and key in seen_headers:
+            errors.append(f"{label}: duplicate header '{header}'")
+        seen_headers.add(key)
+
+        if not description:
+            errors.append(f"{label}: description is required")
+        elif len(description) > _PRICE_TEXT_MAX:
+            errors.append(
+                f"{label}: description '{description}' is "
+                f"{len(description)} chars (max {_PRICE_TEXT_MAX})"
+            )
+
+        try:
+            price = float(row.get("price", 0))
+        except (TypeError, ValueError):
+            price = 0.0
+            errors.append(f"{label}: price must be a number")
+        if price <= 0:
+            errors.append(f"{label}: price must be > 0")
+
+        if not url:
+            errors.append(f"{label}: final_url is required")
+        else:
+            urls_to_check.append(url)
+        if mobile_url:
+            urls_to_check.append(mobile_url)
+
+        if unit and unit not in _VALID_PRICE_UNITS:
+            errors.append(
+                f"{label}: unit '{unit}' invalid; valid: "
+                f"{sorted(_VALID_PRICE_UNITS)} (or empty for none)"
+            )
+
+        normalized_offerings.append(
+            {
+                "header": header,
+                "description": description,
+                "price": price,
+                "final_url": url,
+                "final_mobile_url": mobile_url,
+                "unit": unit,
+            }
+        )
+
+    if errors:
+        return {}, errors
+
+    # Only hit the network once validation has otherwise passed.
+    if urls_to_check:
+        url_checks = _validate_urls(list(dict.fromkeys(urls_to_check)))
+        for url, err in url_checks.items():
+            if err:
+                errors.append(f"final_url '{url}' is not reachable: {err}")
+        if errors:
+            return {}, errors
+
+    normalized = {
+        "price_type": ptype,
+        "price_qualifier": qualifier,
+        "language_code": (language_code or "en").lower(),
+        "currency_code": (currency_code or "USD").upper(),
+        "offerings": normalized_offerings,
+    }
+    return normalized, []
+
+
+def draft_price_asset(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_id: str = "",
+    ad_group_id: str = "",
+    price_type: str = "SERVICES",
+    price_qualifier: str = "FROM",
+    language_code: str = "en",
+    currency_code: str = "USD",
+    offerings: list[dict] | None = None,
+) -> dict:
+    """Draft a price extension asset — returns a PREVIEW.
+
+    Creates a PriceAsset (the price carousel that appears under an ad) and
+    links it at ad group, campaign, or customer scope. Exactly 3-8 offerings
+    are required by Google Ads.
+
+    Scope (most-specific wins):
+        - ad_group_id provided  → AdGroupAsset link.
+        - campaign_id provided  → CampaignAsset link.
+        - both empty            → CustomerAsset link (account-level).
+
+    Required:
+        price_type: what the prices describe — SERVICES, BRANDS, EVENTS,
+            LOCATIONS, NEIGHBORHOODS, PRODUCT_CATEGORIES, PRODUCT_TIERS,
+            SERVICE_CATEGORIES, SERVICE_TIERS.
+        offerings: list of 3-8 dicts, each with:
+            - header (str, <=25 chars, required, unique)
+            - description (str, <=25 chars, required)
+            - price (number, > 0, required) — in ``currency_code``
+            - final_url (str, required) — must return 2xx/3xx (validated)
+            - final_mobile_url (str, optional)
+            - unit (str, optional) — PER_HOUR, PER_DAY, PER_WEEK, PER_MONTH,
+              PER_YEAR, PER_NIGHT
+
+    Optional:
+        price_qualifier: FROM (default), UP_TO, or AVERAGE — leave blank for
+            none. "FROM" surfaces "From $X".
+        language_code: BCP-47 (default "en").
+        currency_code: ISO 4217 (default USD) — applied to every offering.
+
+    IMPORTANT: every price MUST match the price shown on its final_url landing
+    page. Google disapproves price assets whose amounts don't match the page.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_price_asset", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    normalized, errors = _validate_price_inputs(
+        price_type=price_type,
+        price_qualifier=price_qualifier,
+        language_code=language_code,
+        currency_code=currency_code,
+        offerings=offerings,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    scope, entity_type, entity_id = _asset_scope(
+        ad_group_id, campaign_id, customer_id
+    )
+    plan = ChangePlan(
+        operation="create_price_asset",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        changes={
+            "scope": scope,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "price": normalized,
+        },
+    )
+    store_plan(plan)
+    return plan.to_preview()
+
+
+# ---------------------------------------------------------------------------
 # confirm_and_apply — the only function that actually mutates Google Ads
 # ---------------------------------------------------------------------------
 
@@ -2939,6 +3504,9 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         "create_sitelinks": _apply_create_sitelinks,
         "create_call_asset": _apply_create_call_asset,
         "add_ad_schedule": _apply_add_ad_schedule,
+        "create_promotion": _apply_create_promotion,
+        "create_price_asset": _apply_create_price_asset,
+        "update_promotion": _apply_update_promotion,
     }
 
     handler = dispatch.get(plan.operation)
@@ -4062,6 +4630,261 @@ def _apply_create_call_asset(client: object, cid: str, changes: dict) -> dict:
         elif scope == "customer" and resp.customer_asset_result.resource_name:
             result["link"] = resp.customer_asset_result.resource_name
     return result
+
+
+def _populate_promotion_asset(client: object, asset: object, promo: dict) -> None:
+    """Fill an Asset proto with PromotionAsset fields from a normalized dict."""
+    p = asset.promotion_asset
+    p.promotion_target = promo["promotion_target"]
+    if promo.get("money_off"):
+        p.money_amount_off.amount_micros = int(
+            float(promo["money_off"]) * 1_000_000
+        )
+        p.money_amount_off.currency_code = promo["currency_code"]
+    elif promo.get("percent_off"):
+        p.percent_off = int(float(promo["percent_off"]) * 1_000_000)
+
+    if promo.get("promotion_code"):
+        p.promotion_code = promo["promotion_code"]
+
+    if promo.get("orders_over_amount"):
+        p.orders_over_amount.amount_micros = int(
+            float(promo["orders_over_amount"]) * 1_000_000
+        )
+        p.orders_over_amount.currency_code = promo["currency_code"]
+
+    if promo.get("occasion"):
+        p.occasion = getattr(
+            client.enums.PromotionExtensionOccasionEnum, promo["occasion"]
+        )
+
+    if promo.get("discount_modifier"):
+        p.discount_modifier = getattr(
+            client.enums.PromotionExtensionDiscountModifierEnum,
+            promo["discount_modifier"],
+        )
+
+    p.language_code = promo.get("language_code") or "en"
+    if promo.get("start_date"):
+        p.start_date = promo["start_date"]
+    if promo.get("end_date"):
+        p.end_date = promo["end_date"]
+    if promo.get("redemption_start_date"):
+        p.redemption_start_date = promo["redemption_start_date"]
+    if promo.get("redemption_end_date"):
+        p.redemption_end_date = promo["redemption_end_date"]
+
+    for entry in promo.get("ad_schedule") or []:
+        info = client.get_type("AdScheduleInfo")
+        _populate_ad_schedule_info(client, info, entry)
+        p.ad_schedule_targets.append(info)
+
+    asset.final_urls.append(promo["final_url"])
+
+
+def _apply_create_promotion(client: object, cid: str, changes: dict) -> dict:
+    """Create a PromotionAsset and link it at ad group, campaign, or customer scope."""
+
+    def populate(asset: object, payload: dict) -> None:
+        _populate_promotion_asset(client, asset, payload)
+
+    return _apply_assets(
+        client,
+        cid,
+        [changes["promotion"]],
+        client.enums.AssetFieldTypeEnum.PROMOTION,
+        populate,
+        scope=changes.get("scope", "campaign"),
+        campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
+    )
+
+
+def _populate_price_asset(client: object, asset: object, price: dict) -> None:
+    """Fill an Asset proto with PriceAsset fields from a normalized dict."""
+    p = asset.price_asset
+    p.type_ = getattr(
+        client.enums.PriceExtensionTypeEnum, price["price_type"]
+    )
+    if price.get("price_qualifier"):
+        p.price_qualifier = getattr(
+            client.enums.PriceExtensionPriceQualifierEnum,
+            price["price_qualifier"],
+        )
+    p.language_code = price.get("language_code") or "en"
+
+    currency = price.get("currency_code") or "USD"
+    for row in price["offerings"]:
+        offering = client.get_type("PriceOffering")
+        offering.header = row["header"]
+        offering.description = row["description"]
+        offering.price.amount_micros = int(float(row["price"]) * 1_000_000)
+        offering.price.currency_code = currency
+        offering.final_url = row["final_url"]
+        if row.get("final_mobile_url"):
+            offering.final_mobile_url = row["final_mobile_url"]
+        if row.get("unit"):
+            offering.unit = getattr(
+                client.enums.PriceExtensionPriceUnitEnum, row["unit"]
+            )
+        p.price_offerings.append(offering)
+
+
+def _apply_create_price_asset(client: object, cid: str, changes: dict) -> dict:
+    """Create a PriceAsset and link it at ad group, campaign, or customer scope."""
+
+    def populate(asset: object, payload: dict) -> None:
+        _populate_price_asset(client, asset, payload)
+
+    return _apply_assets(
+        client,
+        cid,
+        [changes["price"]],
+        client.enums.AssetFieldTypeEnum.PRICE,
+        populate,
+        scope=changes.get("scope", "campaign"),
+        campaign_id=changes.get("campaign_id", ""),
+        ad_group_id=changes.get("ad_group_id", ""),
+    )
+
+
+def _find_asset_link(
+    client: object,
+    cid: str,
+    asset_id: str,
+    field_type: str,
+    scope: str,
+    campaign_id: str,
+    ad_group_id: str,
+) -> str:
+    """Look up the AdGroupAsset / CampaignAsset / CustomerAsset link resource
+    name for a given asset_id and field type, across any of the three scopes.
+    """
+    googleads_service = client.get_service("GoogleAdsService")
+    asset_service = client.get_service("AssetService")
+    asset_resource = asset_service.asset_path(cid, asset_id)
+
+    if scope == "ad_group":
+        if not ad_group_id:
+            return ""
+        ag_resource = googleads_service.ad_group_path(cid, ad_group_id)
+        query = (
+            "SELECT ad_group_asset.resource_name FROM ad_group_asset "
+            f"WHERE ad_group_asset.asset = '{asset_resource}' "
+            f"  AND ad_group_asset.ad_group = '{ag_resource}' "
+            f"  AND ad_group_asset.field_type = '{field_type}'"
+        )
+    elif scope == "campaign":
+        if not campaign_id:
+            return ""
+        camp_resource = client.get_service("CampaignService").campaign_path(
+            cid, campaign_id
+        )
+        query = (
+            "SELECT campaign_asset.resource_name FROM campaign_asset "
+            f"WHERE campaign_asset.asset = '{asset_resource}' "
+            f"  AND campaign_asset.campaign = '{camp_resource}' "
+            f"  AND campaign_asset.field_type = '{field_type}'"
+        )
+    else:
+        query = (
+            "SELECT customer_asset.resource_name FROM customer_asset "
+            f"WHERE customer_asset.asset = '{asset_resource}' "
+            f"  AND customer_asset.field_type = '{field_type}'"
+        )
+
+    response = googleads_service.search(customer_id=cid, query=query)
+    for row in response:
+        if scope == "ad_group":
+            return row.ad_group_asset.resource_name
+        if scope == "campaign":
+            return row.campaign_asset.resource_name
+        return row.customer_asset.resource_name
+    return ""
+
+
+def _apply_update_promotion(client: object, cid: str, changes: dict) -> dict:
+    """Swap a PromotionAsset: create new + link, then unlink old.
+
+    Steps (create + link batched into one mutate call, then unlink old link):
+      1. Create a new Asset with the new promotion fields.
+      2. Link the new Asset (CampaignAsset or CustomerAsset).
+      3. Remove the old link (matching the old asset_id at the same scope).
+    """
+    asset_service = client.get_service("AssetService")
+    googleads_service = client.get_service("GoogleAdsService")
+    campaign_service = client.get_service("CampaignService")
+
+    scope = changes.get("scope", "campaign")
+    campaign_id = changes.get("campaign_id", "")
+    old_asset_id = str(changes["old_asset_id"])
+    promo = changes["promotion"]
+
+    operations = []
+
+    # 1. Create new Asset
+    create_op = client.get_type("MutateOperation")
+    new_asset = create_op.asset_operation.create
+    new_asset.resource_name = asset_service.asset_path(cid, "-1")
+    _populate_promotion_asset(client, new_asset, promo)
+    operations.append(create_op)
+
+    # 2. Link the new asset
+    if scope == "campaign":
+        if not campaign_id:
+            raise ValueError("campaign_id required for campaign-scope update")
+        link_op = client.get_type("MutateOperation")
+        ca = link_op.campaign_asset_operation.create
+        ca.asset = asset_service.asset_path(cid, "-1")
+        ca.campaign = campaign_service.campaign_path(cid, campaign_id)
+        ca.field_type = client.enums.AssetFieldTypeEnum.PROMOTION
+        operations.append(link_op)
+    elif scope == "customer":
+        link_op = client.get_type("MutateOperation")
+        cust = link_op.customer_asset_operation.create
+        cust.asset = asset_service.asset_path(cid, "-1")
+        cust.field_type = client.enums.AssetFieldTypeEnum.PROMOTION
+        operations.append(link_op)
+    else:
+        raise ValueError(f"Unknown scope: {scope}")
+
+    response = googleads_service.mutate(
+        customer_id=cid, mutate_operations=operations
+    )
+
+    new_asset_resource = ""
+    new_link_resource = ""
+    for resp in response.mutate_operation_responses:
+        if resp.asset_result.resource_name and not new_asset_resource:
+            new_asset_resource = resp.asset_result.resource_name
+        elif scope == "campaign" and resp.campaign_asset_result.resource_name:
+            new_link_resource = resp.campaign_asset_result.resource_name
+        elif scope == "customer" and resp.customer_asset_result.resource_name:
+            new_link_resource = resp.customer_asset_result.resource_name
+
+    # 3. Find the old link and remove it
+    old_link_resource = _find_asset_link(
+        client, cid, old_asset_id, "PROMOTION", scope, campaign_id, ""
+    )
+    old_link_removed = ""
+    if old_link_resource:
+        if scope == "campaign":
+            ca_service = client.get_service("CampaignAssetService")
+            rm_op = client.get_type("CampaignAssetOperation")
+            rm_op.remove = old_link_resource
+            ca_service.mutate_campaign_assets(customer_id=cid, operations=[rm_op])
+        else:
+            cust_service = client.get_service("CustomerAssetService")
+            rm_op = client.get_type("CustomerAssetOperation")
+            rm_op.remove = old_link_resource
+            cust_service.mutate_customer_assets(customer_id=cid, operations=[rm_op])
+        old_link_removed = old_link_resource
+
+    return {
+        "new_asset": new_asset_resource,
+        "new_link": new_link_resource,
+        "old_link_removed": old_link_removed,
+    }
 
 
 def _apply_create_negative_keyword_list(
