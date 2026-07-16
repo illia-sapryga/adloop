@@ -2194,25 +2194,32 @@ def _check_broad_match_safety(
     return []
 
 
-def _validate_rsa(
-    ad_group_id: str,
+def _validate_rsa_assets(
     headlines: list[dict],
     descriptions: list[dict],
-    final_url: str,
+    enforce_headline_count: bool = True,
+    enforce_description_count: bool = True,
 ) -> list[str]:
-    errors = []
-    if not ad_group_id:
-        errors.append("ad_group_id is required")
-    if not final_url:
-        errors.append("final_url is required")
-    if len(headlines) < 3:
-        errors.append(f"Need at least 3 headlines, got {len(headlines)}")
-    if len(headlines) > 15:
-        errors.append(f"Maximum 15 headlines, got {len(headlines)}")
-    if len(descriptions) < 2:
-        errors.append(f"Need at least 2 descriptions, got {len(descriptions)}")
-    if len(descriptions) > 4:
-        errors.append(f"Maximum 4 descriptions, got {len(descriptions)}")
+    """Validate RSA headline/description content: count, char limits, pin slots.
+
+    Shared by ``_validate_rsa`` (full RSA create) and
+    ``update_responsive_search_ad`` (in-place replace of headlines/descriptions).
+    Google enforces 3-15 headlines / 2-4 descriptions whenever a list is sent.
+    The update path passes ``enforce_*_count=False`` for a list it is NOT
+    replacing, since an omitted list stays untouched on the live ad — only the
+    supplied list is gated on count.
+    """
+    errors: list[str] = []
+    if enforce_headline_count:
+        if len(headlines) < 3:
+            errors.append(f"Need at least 3 headlines, got {len(headlines)}")
+        if len(headlines) > 15:
+            errors.append(f"Maximum 15 headlines, got {len(headlines)}")
+    if enforce_description_count:
+        if len(descriptions) < 2:
+            errors.append(f"Need at least 2 descriptions, got {len(descriptions)}")
+        if len(descriptions) > 4:
+            errors.append(f"Maximum 4 descriptions, got {len(descriptions)}")
 
     headline_pin_counts: dict[str, int] = {}
     for i, h in enumerate(headlines):
@@ -2253,6 +2260,22 @@ def _validate_rsa(
     for pin, count in description_pin_counts.items():
         if count > 1:
             errors.append(f"At most 1 description may pin to {pin}; got {count}")
+
+    return errors
+
+
+def _validate_rsa(
+    ad_group_id: str,
+    headlines: list[dict],
+    descriptions: list[dict],
+    final_url: str,
+) -> list[str]:
+    errors = []
+    if not ad_group_id:
+        errors.append("ad_group_id is required")
+    if not final_url:
+        errors.append("final_url is required")
+    errors.extend(_validate_rsa_assets(headlines, descriptions))
 
     return errors
 
