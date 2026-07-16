@@ -2214,6 +2214,83 @@ def draft_remove_conversion_action(
     )
 
 
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_upload_call_conversions(
+    csv_path: str,
+    partial_failure: bool = True,
+    consent: dict | None = None,
+    customer_id: str = "",
+) -> dict:
+    """Draft an offline CALL-conversion upload from a CSV — returns a PREVIEW.
+
+    Uploads phone-call conversions to ConversionUploadService.
+    UploadCallConversions, matching each call back to the ad click by the
+    caller's phone number. The CSV must have columns: Caller's Phone Number,
+    Call Start Time, Conversion Name, Conversion Time, Conversion Value,
+    Conversion Currency. The Conversion Name must match an existing
+    UPLOAD_CALLS-type conversion action exactly.
+
+    PII: the caller phone number is required RAW by Google (it cannot be
+    hashed) — it is redacted in the preview and audit log but stored in the
+    plan so apply uploads exactly what you previewed (no CSV re-read).
+
+    consent (GDPR/EEA): {"ad_user_data": "GRANTED"|"DENIED"|"UNSPECIFIED",
+    "ad_personalization": ...}. Defaults to UNSPECIFIED. Call
+    confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.conversion_actions import (
+        draft_upload_call_conversions as _impl,
+    )
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        csv_path=csv_path,
+        partial_failure=partial_failure,
+        consent=consent,
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags={"ads"})
+@_safe
+def draft_upload_enhanced_conversions_for_leads(
+    csv_path: str,
+    partial_failure: bool = True,
+    consent: dict | None = None,
+    customer_id: str = "",
+) -> dict:
+    """Draft an Enhanced Conversions for LEADS upload from a CSV — PREVIEW.
+
+    Uploads lead conversions to ConversionUploadService.UploadClickConversions
+    with user_identifiers, matching hashed customer PII back to the Google
+    users who clicked the ads. The CSV holds RAW PII in columns: Email, Phone
+    Number, First Name, Last Name (plus Conversion Name, Conversion Time,
+    Conversion Value, Conversion Currency; optional Order ID dedup key).
+
+    PII is normalized and SHA-256-hashed AT PREVIEW TIME — only the hashes are
+    stored in the plan. Raw email/phone/name never land in the plan or the
+    audit log. The target conversion action must be UPLOAD_CLICKS-type.
+
+    Add an Order ID column so re-uploads dedup instead of double-counting.
+
+    consent (GDPR/EEA): {"ad_user_data": "GRANTED"|"DENIED"|"UNSPECIFIED",
+    "ad_personalization": ...}. Defaults to UNSPECIFIED. Call
+    confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.conversion_actions import (
+        draft_upload_enhanced_conversions_for_leads as _impl,
+    )
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        csv_path=csv_path,
+        partial_failure=partial_failure,
+        consent=consent,
+    )
+
+
 @mcp.tool(annotations=_READONLY, tags={"tracking"})
 @_safe
 def validate_tracking(
