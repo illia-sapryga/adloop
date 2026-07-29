@@ -2531,3 +2531,105 @@ def test_a_healthy_page_passes_clean(monkeypatch):
 
     assert errors[url] is None
     assert warnings == {}
+
+
+# --- Performance Max: refuse rather than create something that cannot serve ---
+#
+# A customer asked whether PMax creation was blocked by Google. It is not;
+# the API supports it. But PMax has no ad groups, and Google requires the
+# asset group and all its assets in one atomic mutate, including images we
+# cannot supply. Accepting the channel type produced a campaign shell that
+# could never serve while reporting success.
+
+
+def test_performance_max_is_refused_with_a_reason(monkeypatch):
+    from adloop.ads import write
+
+    errors, warnings = write._validate_campaign(
+        None,
+        campaign_name="PMax Test",
+        daily_budget=50.0,
+        bidding_strategy="MAXIMIZE_CONVERSIONS",
+        target_cpa=0,
+        target_roas=0,
+        channel_type="PERFORMANCE_MAX",
+        keywords=None,
+        geo_target_ids=["2276"],
+        language_ids=["1001"],
+        customer_id="1234567890",
+    )
+
+    joined = " ".join(errors)
+    assert "Performance Max" in joined
+    # The refusal has to explain the cause and the way forward, not just say no.
+    assert "asset group" in joined
+    assert "Google Ads interface" in joined
+
+
+def test_performance_max_refusal_is_case_insensitive():
+    from adloop.ads import write
+
+    errors, _ = write._validate_campaign(
+        None,
+        campaign_name="PMax Test",
+        daily_budget=50.0,
+        bidding_strategy="MAXIMIZE_CONVERSIONS",
+        target_cpa=0,
+        target_roas=0,
+        channel_type="performance_max",
+        keywords=None,
+        geo_target_ids=["2276"],
+        language_ids=["1001"],
+        customer_id="1234567890",
+    )
+
+    assert any("Performance Max" in e for e in errors)
+
+
+def test_other_non_search_types_warn_but_are_allowed():
+    """DISPLAY, SHOPPING and VIDEO do produce a usable campaign.
+
+    Nothing here can populate them, since draft_ad_group is SEARCH-only,
+    but a shell finished in the UI is a legitimate workflow. Only PMax is
+    refused, because a PMax shell can never serve at all.
+    """
+    from adloop.ads import write
+
+    for channel in ("DISPLAY", "SHOPPING", "VIDEO"):
+        errors, warnings = write._validate_campaign(
+            None,
+            campaign_name=f"{channel} Test",
+            daily_budget=50.0,
+            bidding_strategy="MAXIMIZE_CONVERSIONS",
+            target_cpa=0,
+            target_roas=0,
+            channel_type=channel,
+            keywords=None,
+            geo_target_ids=["2276"],
+            language_ids=["1001"],
+            customer_id="1234567890",
+        )
+
+        assert not any("Performance Max" in e for e in errors), channel
+        assert any("shell only" in w for w in warnings), channel
+
+
+def test_search_campaigns_get_neither_the_refusal_nor_the_shell_warning():
+    from adloop.ads import write
+
+    errors, warnings = write._validate_campaign(
+        None,
+        campaign_name="Search Test",
+        daily_budget=50.0,
+        bidding_strategy="MAXIMIZE_CONVERSIONS",
+        target_cpa=0,
+        target_roas=0,
+        channel_type="SEARCH",
+        keywords=None,
+        geo_target_ids=["2276"],
+        language_ids=["1001"],
+        customer_id="1234567890",
+    )
+
+    assert not any("Performance Max" in e for e in errors)
+    assert not any("shell only" in w for w in warnings)

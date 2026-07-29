@@ -2322,6 +2322,32 @@ def _validate_campaign(
             f"channel_type must be one of {sorted(_VALID_CHANNEL_TYPES)}, "
             f"got '{channel_type}'"
         )
+
+    # Performance Max has no ad groups. Every campaign needs at least one
+    # asset group, and the API requires the asset group plus all of its
+    # required assets in a single atomic mutate. We cannot supply the
+    # images, so creating the campaign alone would leave the user with
+    # something that can never serve while reporting success.
+    if ct == "PERFORMANCE_MAX":
+        errors.append(
+            "Performance Max campaigns cannot be created yet. PMax has no ad "
+            "groups: a campaign needs at least one asset group, and Google "
+            "requires the asset group and all its assets (headlines, "
+            "descriptions, business name, logo, and images in several aspect "
+            "ratios) in one atomic request. Creating the campaign on its own "
+            "would produce a campaign that can never serve. Create it in the "
+            "Google Ads interface, then use AdLoop to analyse it — "
+            "get_pmax_performance reports per-asset-group Ad Strength."
+        )
+    elif ct != "SEARCH":
+        # These do produce a usable campaign, but nothing here can populate
+        # them: draft_ad_group refuses anything that is not SEARCH.
+        warnings.append(
+            f"{ct} campaigns are created as a shell only. AdLoop can add ad "
+            f"groups, ads and keywords to SEARCH campaigns; finish this one "
+            f"in the Google Ads interface."
+        )
+
     if ct != "SEARCH" and search_partners_enabled:
         errors.append("search_partners_enabled is only supported for SEARCH campaigns")
     if ct != "SEARCH" and display_network_enabled:
