@@ -41,6 +41,14 @@ class GscConfig:
 class GtmConfig:
     account_id: str = ""
     container_id: str = ""
+    # Opt-in: GTM write tools (draft tag/trigger changes, publish). Off by
+    # default so nobody grants Tag Manager edit + publish authority unless
+    # they use it; turning it on adds the write scopes to the OAuth grant.
+    write_enabled: bool = False
+    # Custom HTML tags run arbitrary JavaScript on every page they fire on.
+    # Even with writes enabled, AdLoop refuses to create/edit them — or to
+    # publish a workspace that adds/changes one — unless this is also on.
+    allow_custom_html: bool = False
 
 
 @dataclass
@@ -97,6 +105,17 @@ class AdLoopConfig:
 def _resolve_path(path_str: str) -> Path:
     """Expand ~ and env vars in a path string."""
     return Path(os.path.expandvars(os.path.expanduser(path_str)))
+
+
+def _flag(raw: dict, key: str) -> bool:
+    """Read an opt-in boolean strictly: only a real true (or true/yes/on/1
+    as text) enables it. ``bool("false")`` is True, which must never be how
+    a safety gate gets switched on.
+    """
+    value = raw.get(key, False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "yes", "on", "1")
 
 
 def _text(raw: dict, key: str, default: str = "") -> str:
@@ -168,6 +187,8 @@ def load_config(config_path: str | None = None) -> AdLoopConfig:
         gtm=GtmConfig(
             account_id=_text(gtm_raw, "account_id"),
             container_id=_text(gtm_raw, "container_id"),
+            write_enabled=_flag(gtm_raw, "write_enabled"),
+            allow_custom_html=_flag(gtm_raw, "allow_custom_html"),
         ),
         pagespeed=PageSpeedConfig(
             api_key=_text(pagespeed_raw, "api_key"),

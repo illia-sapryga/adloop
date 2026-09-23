@@ -18,3 +18,19 @@ def get_gtm_client(config: AdLoopConfig):
     return build(
         "tagmanager", "v2", credentials=credentials, cache_discovery=False
     )
+
+
+def get_gtm_write_client(config: AdLoopConfig):
+    """Tag Manager API v2 client with edit + publish scopes.
+
+    Raises unless ``gtm.write_enabled`` is set (see
+    :func:`adloop.auth.get_gtm_write_credentials`).
+    """
+    from googleapiclient.discovery import build
+
+    from adloop.auth import get_gtm_write_credentials
+
+    credentials = get_gtm_write_credentials(config)
+    return build(
+        "tagmanager", "v2", credentials=credentials, cache_discovery=False
+    )

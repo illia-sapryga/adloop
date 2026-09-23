@@ -53,6 +53,16 @@ gtm:
   # gtm_account_id / gtm_container_id as parameters in each call instead.
   account_id: ""
   container_id: ""
+  # GTM write tools (draft_gtm_tag / draft_gtm_trigger / draft_delete_gtm_entity
+  # / draft_publish_gtm_workspace). Off by default. Turning it on adds the
+  # Tag Manager edit + publish scopes to the OAuth grant — you'll be asked to
+  # re-consent once. Turning it back off does not revoke an existing grant;
+  # delete ~/.adloop/token.json for that.
+  write_enabled: false
+  # Custom HTML tags execute arbitrary JavaScript on your site. Even with
+  # write_enabled, AdLoop refuses to create/edit them, or publish a workspace
+  # that adds/changes one, unless this is also true.
+  allow_custom_html: false
 
 pagespeed:
   # Optional Google API key for PageSpeed Insights (analyze_page_speed).

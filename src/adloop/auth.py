@@ -48,6 +48,14 @@ _GTM_SCOPES = [
     "https://www.googleapis.com/auth/tagmanager.readonly",
 ]
 
+# Opt-in via gtm.write_enabled — never part of the default grant, so users
+# who only audit tags never hand AdLoop publish authority over a container.
+_GTM_WRITE_SCOPES = [
+    "https://www.googleapis.com/auth/tagmanager.edit.containers",
+    "https://www.googleapis.com/auth/tagmanager.edit.containerversions",
+    "https://www.googleapis.com/auth/tagmanager.publish",
+]
+
 _GSC_SCOPES = [
     "https://www.googleapis.com/auth/webmasters.readonly",
 ]
@@ -73,6 +81,8 @@ class CredentialsProvider(Protocol):
     def ads_credentials(self, config: AdLoopConfig) -> Credentials: ...
 
     def gtm_credentials(self, config: AdLoopConfig) -> Credentials: ...
+
+    def gtm_write_credentials(self, config: AdLoopConfig) -> Credentials: ...
 
     def gsc_credentials(self, config: AdLoopConfig) -> Credentials: ...
 
@@ -110,6 +120,10 @@ class LocalFileCredentialsProvider:
     def gtm_credentials(self, config: AdLoopConfig) -> Credentials:
         self._guard_local_only()
         return _local_credentials(config, _GTM_SCOPES)
+
+    def gtm_write_credentials(self, config: AdLoopConfig) -> Credentials:
+        self._guard_local_only()
+        return _local_credentials(config, _GTM_SCOPES + _GTM_WRITE_SCOPES)
 
     def gsc_credentials(self, config: AdLoopConfig) -> Credentials:
         self._guard_local_only()
@@ -216,6 +230,29 @@ def get_gtm_credentials(config: AdLoopConfig) -> Credentials:
     return provider.gtm_credentials(config)
 
 
+def get_gtm_write_credentials(config: AdLoopConfig) -> Credentials:
+    """Return credentials carrying the Tag Manager edit + publish scopes.
+
+    Separate from :func:`get_gtm_credentials` so a hosted provider can roll
+    out GTM reads without ever minting write-capable tokens: providers that
+    don't implement ``gtm_write_credentials`` get a capability error.
+    """
+    if not config.gtm.write_enabled:
+        raise RuntimeError(
+            "GTM writes are disabled. Set 'write_enabled: true' under 'gtm:' "
+            "in the AdLoop config and restart the MCP server; the next call "
+            "asks you to re-consent with the Tag Manager edit + publish scopes."
+        )
+    provider = _active_provider
+    if not hasattr(provider, "gtm_write_credentials"):
+        raise RuntimeError(
+            "This deployment's credentials provider does not support "
+            "Google Tag Manager writes. GTM write tools are only available "
+            "where the provider implements gtm_write_credentials()."
+        )
+    return provider.gtm_write_credentials(config)
+
+
 def get_gsc_credentials(config: AdLoopConfig) -> Credentials:
     """Return authenticated credentials for the Search Console API."""
     provider = _active_provider
@@ -252,6 +289,14 @@ def get_reddit_credentials(config: AdLoopConfig) -> RedditCredentials:
     return provider.reddit_credentials(config)
 
 
+def _requested_scopes(config: AdLoopConfig) -> list[str]:
+    """Scopes for the shared local token: the base set, plus GTM write
+    scopes only when the user opted in via ``gtm.write_enabled``."""
+    if config.gtm.write_enabled:
+        return _ALL_SCOPES + _GTM_WRITE_SCOPES
+    return list(_ALL_SCOPES)
+
+
 def _oauth_flow(
     config: AdLoopConfig, creds_path: Path | None = None
 ) -> Credentials:
@@ -278,17 +323,18 @@ def _oauth_flow(
             "credentials.json at ~/.adloop/credentials.json"
         )
 
+    scopes = _requested_scopes(config)
     creds = None
     if token_path.exists():
         stored_scopes = _stored_token_scopes(token_path)
-        if stored_scopes is None or set(_ALL_SCOPES) - set(stored_scopes):
+        if stored_scopes is None or set(scopes) - set(stored_scopes):
             # Token predates newer scopes (or is unreadable). Google
             # rejects scope expansion at refresh with invalid_scope, so
             # discard it and fall through to a fresh consent flow.
             token_path.unlink(missing_ok=True)
         else:
             creds = OAuthCredentials.from_authorized_user_file(
-                str(token_path), _ALL_SCOPES
+                str(token_path), scopes
             )
 
     if creds and creds.valid:
@@ -321,10 +367,10 @@ def _oauth_flow(
             raise
     else:
         flow = InstalledAppFlow.from_client_secrets_file(
-            str(creds_path), _ALL_SCOPES
+            str(creds_path), scopes
         )
         creds = _run_oauth_with_fallback(flow)
-        _verify_granted_scopes(creds)
+        _verify_granted_scopes(creds, scopes)
 
     token_path.parent.mkdir(parents=True, exist_ok=True)
     with open(token_path, "w") as f:
@@ -333,7 +379,9 @@ def _oauth_flow(
     return creds
 
 
-def _verify_granted_scopes(creds: Credentials) -> None:
+def _verify_granted_scopes(
+    creds: Credentials, requested: list[str] | None = None
+) -> None:
     """Reject a consent that granted fewer scopes than AdLoop requested.
 
     Google's consent screen lets users uncheck individual scopes. Local
@@ -342,7 +390,7 @@ def _verify_granted_scopes(creds: Credentials) -> None:
     call — fail loudly once instead of looping.
     """
     granted = set(getattr(creds, "scopes", None) or [])
-    missing = set(_ALL_SCOPES) - granted
+    missing = set(requested or _ALL_SCOPES) - granted
     if missing:
         raise RuntimeError(
             "Google authorization completed, but these scopes were not "
