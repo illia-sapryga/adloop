@@ -2265,7 +2265,7 @@ def draft_sitelinks(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft call asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_call_asset(
     phone_number: str,
@@ -2308,7 +2308,7 @@ def draft_call_asset(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Add ad schedule", annotations=_WRITE, tags={"ads"})
 @_safe
 def add_ad_schedule(
     campaign_id: str,
@@ -2339,7 +2339,7 @@ def add_ad_schedule(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft promotion asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_promotion(
     promotion_target: str,
@@ -2398,7 +2398,7 @@ def draft_promotion(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update promotion asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_promotion(
     asset_id: str,
@@ -2456,7 +2456,7 @@ def update_promotion(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft price asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_price_asset(
     offerings: _DictList,
@@ -2497,7 +2497,7 @@ def draft_price_asset(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update structured snippet", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_structured_snippet(
     asset_id: str,
@@ -2533,7 +2533,7 @@ def update_structured_snippet(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update call asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_call_asset(
     asset_id: str,
@@ -2571,7 +2571,7 @@ def update_call_asset(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update sitelink", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_sitelink(
     asset_id: str,
@@ -2604,7 +2604,7 @@ def update_sitelink(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update callout", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_callout(
     asset_id: str,
@@ -2628,7 +2628,7 @@ def update_callout(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft location asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_location_asset(
     business_profile_account_id: str,
@@ -2664,7 +2664,7 @@ def draft_location_asset(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft business name asset", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_business_name_asset(
     business_name: str,
@@ -2690,7 +2690,7 @@ def draft_business_name_asset(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Link asset to account", annotations=_WRITE, tags={"ads"})
 @_safe
 def link_asset_to_customer(
     links: _DictList,
