@@ -1940,7 +1940,8 @@ def draft_sitelinks(
 
 # ---------------------------------------------------------------------------
 # confirm_and_apply — the only function that actually mutates an ad account
-# (Google Ads here; Reddit plans are dispatched to adloop.reddit.write)
+# (Google Ads here; Reddit plans are dispatched to adloop.reddit.write and
+# Tag Manager plans to adloop.gtm.write)
 # ---------------------------------------------------------------------------
 
 
@@ -2004,16 +2005,24 @@ def confirm_and_apply(
         dry_run = True
 
     is_reddit = plan.operation.startswith("reddit_")
-    platform_label = "Reddit Ads" if is_reddit else "Google Ads"
+    is_gtm = plan.operation.startswith("gtm_")
+    platform_label = (
+        "Reddit Ads" if is_reddit
+        else "Google Tag Manager" if is_gtm
+        else "Google Ads"
+    )
 
     if dry_run:
         preflight_checks: dict | None = None
-        if is_reddit:
-            # Reddit has no validate-only mode; the dry run re-reads the
-            # target and re-runs the safety caps against live values. A
-            # failed preflight leaves dry_run_result unset so two-phase
-            # apply keeps refusing the real write.
-            from adloop.reddit.write import preflight
+        if is_reddit or is_gtm:
+            # Neither Reddit nor Tag Manager has a validate-only mode; the
+            # dry run re-reads the target and re-runs the safety checks
+            # against live values. A failed preflight leaves dry_run_result
+            # unset so two-phase apply keeps refusing the real write.
+            if is_reddit:
+                from adloop.reddit.write import preflight
+            else:
+                from adloop.gtm.write import preflight
 
             try:
                 preflight_checks = preflight(config, plan)
@@ -2036,9 +2045,9 @@ def confirm_and_apply(
                     "operation": plan.operation,
                     "error": error_message,
                     "message": (
-                        "The dry run re-checked the target against Reddit and "
-                        "found a problem; nothing was sent. Fix the cause and "
-                        "draft again."
+                        f"The dry run re-checked the target against "
+                        f"{platform_label} and found a problem; nothing was "
+                        f"sent. Fix the cause and draft again."
                     ),
                 }
         log_mutation(
@@ -2071,8 +2080,9 @@ def confirm_and_apply(
         if preflight_checks is not None:
             response["checks"] = preflight_checks
             response["note"] = (
-                "Reddit Ads has no validate-only mode: the dry run re-read the "
-                "target and re-checked the safety caps; nothing was sent."
+                f"{platform_label} has no validate-only mode: the dry run "
+                "re-read the target and re-checked the safety caps; nothing "
+                "was sent."
             )
         if forced_by_config:
             # The caller passed dry_run=false but safety.require_dry_run
@@ -2862,6 +2872,12 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
         from adloop.reddit.write import apply_plan
 
         return apply_plan(config, plan)
+
+    # Tag Manager plans likewise never touch the Ads client.
+    if plan.operation.startswith("gtm_"):
+        from adloop.gtm.write import apply_plan as apply_gtm_plan
+
+        return apply_gtm_plan(config, plan)
 
     # GA4 plans dispatch before Ads client construction so they work for
     # GA4-only setups (no Ads credentials/developer token required).
