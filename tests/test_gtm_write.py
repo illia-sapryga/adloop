@@ -738,8 +738,8 @@ class TestServerRegistration:
         for name in ("draft_gtm_tag", "draft_gtm_trigger",
                      "draft_delete_gtm_entity", "draft_publish_gtm_workspace"):
             assert tools[name].tags == {"gtm"}, name
-        assert tools["draft_delete_gtm_entity"].annotations.destructive_hint
-        assert tools["draft_publish_gtm_workspace"].annotations.destructive_hint
+        assert tools["draft_delete_gtm_entity"].annotations.destructiveHint
+        assert tools["draft_publish_gtm_workspace"].annotations.destructiveHint
 
     @pytest.mark.asyncio
     async def test_json_string_list_params_are_coerced(self, tmp_path, fake):
