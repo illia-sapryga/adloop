@@ -53,3 +53,71 @@ class TestLoadConfig:
         monkeypatch.setenv("ADLOOP_CONFIG", str(tmp_path / "from-env.yaml"))
         config = load_config()
         assert config.source_path == str(tmp_path / "from-env.yaml")
+
+
+class TestBlankValuesFallBackToDefaults:
+    """An explicit empty value must mean "unset", not "use empty" (issue #65)."""
+
+    def _write(self, tmp_path, body):
+        path = tmp_path / "config.yaml"
+        path.write_text(body)
+        return path
+
+    def test_blank_token_path_uses_the_default(self, tmp_path):
+        from adloop.config import load_config
+
+        # Path("") is Path("."), the cwd always exists, so adloop read the
+        # working directory as a token file and died with a message that
+        # pointed nowhere near the config.
+        path = self._write(tmp_path, 'google:\n  token_path: ""\n')
+        assert load_config(str(path)).google.token_path == "~/.adloop/token.json"
+
+    def test_whitespace_only_token_path_uses_the_default(self, tmp_path):
+        from adloop.config import load_config
+
+        path = self._write(tmp_path, 'google:\n  token_path: "   "\n')
+        assert load_config(str(path)).google.token_path == "~/.adloop/token.json"
+
+    def test_blank_log_file_uses_the_default(self, tmp_path):
+        from adloop.config import load_config
+
+        path = self._write(tmp_path, 'safety:\n  log_file: ""\n')
+        assert load_config(str(path)).safety.log_file == "~/.adloop/audit.log"
+
+    def test_a_real_value_still_wins(self, tmp_path):
+        from adloop.config import load_config
+
+        path = self._write(tmp_path, 'google:\n  token_path: "/tmp/t.json"\n')
+        assert load_config(str(path)).google.token_path == "/tmp/t.json"
+
+    def test_numeric_customer_id_arrives_as_text(self, tmp_path):
+        from adloop.config import load_config
+
+        path = self._write(tmp_path, "ads:\n  customer_id: 1234567890\n")
+        assert load_config(str(path)).ads.customer_id == "1234567890"
+
+
+def test_ads_client_omits_the_developer_token_when_none_is_configured(monkeypatch):
+    """Access levels belong to the Cloud project since 2026-09-09; a config
+    without a token must not send an empty header, and one with a legacy
+    token keeps sending it."""
+    from adloop import config as config_module
+    from adloop.ads import client as ads_client
+
+    captured: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, credentials=None, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr("google.ads.googleads.client.GoogleAdsClient", FakeClient)
+    monkeypatch.setattr(ads_client, "get_ads_credentials", lambda cfg: object(), raising=False)
+    monkeypatch.setattr("adloop.auth.get_ads_credentials", lambda cfg: object())
+
+    ads_client.get_ads_client(config_module.AdLoopConfig())
+    assert "developer_token" not in captured[-1]
+
+    ads_client.get_ads_client(
+        config_module.AdLoopConfig(ads=config_module.AdsConfig(developer_token="legacy"))
+    )
+    assert captured[-1]["developer_token"] == "legacy"

@@ -49,6 +49,22 @@ class PageSpeedConfig:
 
 
 @dataclass
+class RedditConfig:
+    """Reddit Ads: own OAuth app (Reddit Business Manager → Developer
+    Application), own token file. ``ad_account_id`` is the default account
+    for every Reddit tool; ``username`` only feeds the User-Agent Reddit
+    asks for (``platform:app:version (by /u/name)``)."""
+
+    client_id: str = ""
+    client_secret: str = ""
+    ad_account_id: str = ""
+    business_id: str = ""
+    username: str = ""
+    user_agent: str = ""  # empty = built from client_id + username
+    token_path: str = "~/.adloop/reddit_token.json"
+
+
+@dataclass
 class SafetyConfig:
     max_daily_budget: float = 50.0
     max_bid_increase_pct: int = 100
@@ -70,6 +86,7 @@ class AdLoopConfig:
     gsc: GscConfig = field(default_factory=GscConfig)
     gtm: GtmConfig = field(default_factory=GtmConfig)
     pagespeed: PageSpeedConfig = field(default_factory=PageSpeedConfig)
+    reddit: RedditConfig = field(default_factory=RedditConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     # Absolute path the config was resolved from (even if it did not exist
     # on disk when loaded). Used by the runtime to tell callers exactly
@@ -81,6 +98,26 @@ def _resolve_path(path_str: str) -> Path:
     """Expand ~ and env vars in a path string."""
     return Path(os.path.expandvars(os.path.expanduser(path_str)))
 
+
+def _text(raw: dict, key: str, default: str = "") -> str:
+    """Read a string setting, treating blank as absent.
+
+    ``raw.get(key, default)`` only falls back when the key is *missing*, so an
+    explicit ``token_path: ""`` — easy to produce from a template with blank
+    placeholders — passed straight through. ``Path("")`` is ``Path(".")``, the
+    working directory always exists, and adloop then tried to read the cwd as
+    a token file and died with ``[Errno 1] Operation not permitted: '.'``,
+    which points nowhere near the config that caused it.
+
+    Also coerces non-strings, so ``customer_id: 1234567890`` in YAML arrives
+    as text rather than an int.
+    """
+    value = raw.get(key, default)
+
+    if value is None:
+        return default
+
+    return str(value).strip() or default
 
 def load_config(config_path: str | None = None) -> AdLoopConfig:
     """Load configuration from YAML file.
@@ -108,38 +145,48 @@ def load_config(config_path: str | None = None) -> AdLoopConfig:
     gsc_raw = raw.get("gsc", {})
     gtm_raw = raw.get("gtm", {})
     pagespeed_raw = raw.get("pagespeed", {})
+    reddit_raw = raw.get("reddit", {}) or {}
     safety_raw = raw.get("safety", {})
 
     return AdLoopConfig(
         google=GoogleConfig(
-            project_id=google_raw.get("project_id", ""),
-            credentials_path=google_raw.get("credentials_path", ""),
-            token_path=google_raw.get("token_path", "~/.adloop/token.json"),
+            project_id=_text(google_raw, "project_id"),
+            credentials_path=_text(google_raw, "credentials_path"),
+            token_path=_text(google_raw, "token_path", "~/.adloop/token.json"),
         ),
         ga4=GA4Config(
-            property_id=ga4_raw.get("property_id", ""),
+            property_id=_text(ga4_raw, "property_id"),
         ),
         ads=AdsConfig(
-            developer_token=ads_raw.get("developer_token", ""),
-            customer_id=ads_raw.get("customer_id", ""),
-            login_customer_id=ads_raw.get("login_customer_id", ""),
+            developer_token=_text(ads_raw, "developer_token"),
+            customer_id=_text(ads_raw, "customer_id"),
+            login_customer_id=_text(ads_raw, "login_customer_id"),
         ),
         gsc=GscConfig(
-            site_url=gsc_raw.get("site_url", ""),
+            site_url=_text(gsc_raw, "site_url"),
         ),
         gtm=GtmConfig(
-            account_id=str(gtm_raw.get("account_id", "")),
-            container_id=str(gtm_raw.get("container_id", "")),
+            account_id=_text(gtm_raw, "account_id"),
+            container_id=_text(gtm_raw, "container_id"),
         ),
         pagespeed=PageSpeedConfig(
-            api_key=str(pagespeed_raw.get("api_key", "")),
+            api_key=_text(pagespeed_raw, "api_key"),
+        ),
+        reddit=RedditConfig(
+            client_id=_text(reddit_raw, "client_id"),
+            client_secret=_text(reddit_raw, "client_secret"),
+            ad_account_id=_text(reddit_raw, "ad_account_id"),
+            business_id=_text(reddit_raw, "business_id"),
+            username=_text(reddit_raw, "username"),
+            user_agent=_text(reddit_raw, "user_agent"),
+            token_path=_text(reddit_raw, "token_path", "~/.adloop/reddit_token.json"),
         ),
         safety=SafetyConfig(
             max_daily_budget=safety_raw.get("max_daily_budget", 50.0),
             max_bid_increase_pct=safety_raw.get("max_bid_increase_pct", 100),
             require_dry_run=safety_raw.get("require_dry_run", True),
             two_phase_apply=safety_raw.get("two_phase_apply", False),
-            log_file=safety_raw.get("log_file", "~/.adloop/audit.log"),
+            log_file=_text(safety_raw, "log_file", "~/.adloop/audit.log"),
             blocked_operations=safety_raw.get("blocked_operations", []),
         ),
         source_path=resolved,

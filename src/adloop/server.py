@@ -30,6 +30,7 @@ TOOLSETS: dict[str, str] = {
     "gsc": "Search Console reads",
     "web": "PageSpeed / web performance",
     "merchant": "Merchant Center reads",
+    "reddit": "Reddit Ads reads, writes, and planning",
 }
 
 
@@ -72,6 +73,9 @@ _DictListOpt = Annotated[
 _StrOrDictList = Annotated[
     list[str | dict], BeforeValidator(_coerce_json_string_to_list)
 ]
+_StrOrDictListOpt = Annotated[
+    list[str | dict] | None, BeforeValidator(_coerce_json_string_to_list)
+]
 
 def _build_orchestration_instructions() -> str:
     """Compact orchestration hint sent via MCP ``InitializeResult.instructions``.
@@ -93,7 +97,7 @@ def _build_orchestration_instructions() -> str:
     and the most common cost-burning mistakes.
     """
     return (
-        "AdLoop connects Google Ads + Google Analytics (GA4) + your codebase. "
+        "AdLoop connects Google Ads + Google Analytics (GA4) + Reddit Ads + your codebase. "
         "These are the *minimum* orchestration rules — the full ruleset lives "
         "in `.cursor/rules/adloop.mdc` or `~/.claude/CLAUDE.md` (run "
         "`adloop install-rules` to install globally). Read these before using "
@@ -106,8 +110,8 @@ def _build_orchestration_instructions() -> str:
         "`dry_run=false` after the user explicitly approves the preview. "
         "`require_dry_run` in config can override this.\n"
         "- Respect the config's `max_daily_budget` cap.\n"
-        "- New campaigns and RSAs are created PAUSED. The user must enable "
-        "them after review.\n"
+        "- New campaigns, ad groups, RSAs and Reddit ads are created PAUSED. "
+        "The user must enable them after review.\n"
         "- One change at a time — don't batch unrelated writes.\n\n"
         "PRE-WRITE CHECKS (before any `draft_*`):\n"
         "- BROAD match keywords require Smart Bidding (MAXIMIZE_CONVERSIONS, "
@@ -155,31 +159,128 @@ mcp = FastMCP(
 )
 
 
+def _reddit_structured_error(exc: Exception) -> dict | None:
+    """Reddit-specific translations; keyed on exception type so Reddit's
+    ``invalid_grant`` never gets the "Reconnect Google" hint below."""
+    from adloop.reddit.auth import RedditApiError, RedditAuthError
+    from adloop.runtime import deployment_mode
+
+    hosted = deployment_mode() == "server"
+    if isinstance(exc, RedditAuthError):
+        if exc.error_code == "invalid_grant":
+            return {
+                "error": "Reddit authentication failed — the refresh token was revoked or expired.",
+                "hint": (
+                    "Reconnect Reddit Ads in your AdLoop Cloud dashboard "
+                    "(Settings → Reddit Ads), then retry."
+                    if hosted
+                    else "Run `adloop init` and redo the Reddit Ads step (the old "
+                    "token at ~/.adloop/reddit_token.json was discarded)."
+                ),
+                "auth_error": "REDDIT_INVALID_GRANT",
+            }
+        if exc.error_code in ("missing_refresh_token", "missing_client"):
+            return {
+                "error": str(exc),
+                "hint": (
+                    "Connect Reddit Ads in your AdLoop Cloud dashboard (Settings → Reddit Ads)."
+                    if hosted
+                    else "Run `adloop init` and complete the Reddit Ads step, or set "
+                    "reddit.client_id / reddit.client_secret / reddit.token_path in the config."
+                ),
+                "auth_error": "REDDIT_NOT_CONNECTED",
+            }
+        if exc.error_code == "insufficient_scope":
+            return {
+                "error": str(exc),
+                "hint": (
+                    "Reconnect Reddit Ads in the dashboard and approve write access."
+                    if hosted
+                    else "Re-run the Reddit step of `adloop init`; it requests adsread and adsedit."
+                ),
+                "auth_error": "REDDIT_INSUFFICIENT_SCOPES",
+            }
+        return {
+            "error": str(exc),
+            "hint": (
+                "Reconnect Reddit Ads (Settings → Reddit Ads)."
+                if hosted
+                else "Check reddit.client_id / reddit.client_secret and re-run `adloop init`."
+            ),
+            "auth_error": "REDDIT_AUTH_FAILED",
+        }
+    if isinstance(exc, RedditApiError):
+        if exc.status == 429:
+            return {
+                "error": str(exc),
+                "hint": (
+                    "Reddit rate-limits per user and endpoint group (reporting: 60 "
+                    "requests/min). Wait for the reset before calling again; do "
+                    "not retry in a loop."
+                ),
+                "auth_error": "REDDIT_RATE_LIMITED",
+                "reset_seconds": exc.reset_seconds,
+            }
+        if exc.status == 403:
+            return {
+                "error": str(exc),
+                "hint": (
+                    "The authorizing Reddit user needs a role on this ad account "
+                    "(Business Manager → Ad accounts → Members) and the token needs "
+                    "the adsedit scope for writes. Check ad_account_id against "
+                    "list_reddit_accounts."
+                ),
+                "auth_error": "REDDIT_FORBIDDEN",
+            }
+        if exc.status == 404:
+            return {
+                "error": str(exc),
+                "hint": "The entity or ad account id does not exist or is not visible to this user.",
+            }
+        return {"error": str(exc), "reddit_status": exc.status}
+    return None
+
+
 def _structured_error(fn_name: str, exc: Exception) -> dict:
     """Translate common auth failures into actionable structured errors."""
+    reddit = _reddit_structured_error(exc)
+    if reddit is not None:
+        reddit.setdefault("tool", fn_name)
+        return reddit
+
     err = str(exc)
     err_lower = err.lower()
 
-    if "developer_token_not_approved" in err_lower or "only approved for use with test accounts" in err_lower:
+    # Access levels belong to the Google Cloud project that owns the OAuth
+    # client (developer tokens were sunset on 2026-09-09). v25+ names the
+    # project; older API versions still answer with the token wording.
+    if (
+        "cloud_project_not_approved_for_production" in err_lower
+        or "developer_token_not_approved" in err_lower
+        or "only approved for use with test accounts" in err_lower
+    ):
         return {
             "error": (
-                "Google Ads authorization failed — developer token is not "
-                "approved for production accounts."
+                "Google Ads authorization failed — your Google Cloud project's "
+                "API access level (Test) cannot reach production accounts."
             ),
             "hint": (
-                "This developer token can only access Google Ads test accounts. "
-                "Apply for Basic or Standard access in the Google Ads API Center, "
-                "or switch AdLoop to a test account."
+                "Open the project's Google Ads API Overview page "
+                "(https://console.cloud.google.com/google/ads-apis/overview) and "
+                "apply for Explorer access (usually granted automatically) or "
+                "Basic access (needs the OAuth consent screen brand-verified: "
+                "External and In production). Or switch AdLoop to a test account."
             ),
-            "auth_error": "DEVELOPER_TOKEN_NOT_APPROVED",
+            "auth_error": "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION",
         }
 
     if "developer_token_invalid" in err_lower or "developer token is not valid" in err_lower:
         return {
-            "error": "Google Ads authentication failed — developer token is invalid.",
+            "error": "Google Ads authentication failed — the configured developer token is invalid.",
             "hint": (
-                "Update `ads.developer_token` in `~/.adloop/config.yaml` with "
-                "the token from your Google Ads manager account API Center. "
+                "Since September 2026 no developer token is needed: remove "
+                "`ads.developer_token` from `~/.adloop/config.yaml`. API access "
+                "belongs to the Google Cloud project that owns your OAuth client. "
                 "OAuth is working if GA4 tools succeed."
             ),
             "auth_error": "DEVELOPER_TOKEN_INVALID",
@@ -285,10 +386,11 @@ def _safe(fn: Callable) -> Callable:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"core"})
+@mcp.tool(title="Connection health check", annotations=_READONLY, tags={"core"})
 @_safe
 def health_check() -> dict:
-    """Test AdLoop connectivity — checks OAuth token, GA4 API, and Google Ads API.
+    """Test AdLoop connectivity — checks OAuth token, GA4 API, Google Ads API,
+    and (when configured) the Reddit Ads API.
 
     Run this first if other tools are failing. Returns status for each service
     and actionable guidance if something is broken.
@@ -358,11 +460,33 @@ def health_check() -> dict:
         if "details" in parsed:
             status["ads_error_details"] = parsed["details"]
 
+    reddit_cfg = current_config().reddit
+    if reddit_cfg.ad_account_id or reddit_cfg.client_id:
+        try:
+            from adloop.reddit.client import data_of, reddit_get
+
+            me = data_of(reddit_get(current_config(), "me"))
+            status["reddit"] = "ok"
+            status["reddit_username"] = me.get("reddit_username")
+            status["reddit_ad_account_id"] = reddit_cfg.ad_account_id or None
+        except Exception as e:
+            parsed = _structured_error("health_check", e)
+            status["reddit"] = "error"
+            status["reddit_error"] = parsed["error"]
+            if "hint" in parsed:
+                status["reddit_hint"] = parsed["hint"]
+            if "auth_error" in parsed:
+                status["reddit_auth_error"] = parsed["auth_error"]
+    else:
+        status["reddit"] = "not_configured"
+
     if status["ga4"] == "error" or status["ads"] == "error":
         if status.get("ads_hint"):
             status["hint"] = status["ads_hint"]
         elif status.get("ga4_hint"):
             status["hint"] = status["ga4_hint"]
+    elif status.get("reddit") == "error" and status.get("reddit_hint"):
+        status["hint"] = status["reddit_hint"]
 
     return status
 
@@ -372,7 +496,7 @@ def health_check() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"ga4"})
+@mcp.tool(title="List Analytics properties", annotations=_READONLY, tags={"ga4"})
 @_safe
 def get_account_summaries() -> dict:
     """List all GA4 accounts and properties accessible by the authenticated user.
@@ -385,7 +509,7 @@ def get_account_summaries() -> dict:
     return _impl(current_config())
 
 
-@mcp.tool(annotations=_READONLY, tags={"ga4"})
+@mcp.tool(title="Analytics report", annotations=_READONLY, tags={"ga4"})
 @_safe
 def run_ga4_report(
     dimensions: _StrListOpt = None,
@@ -416,7 +540,7 @@ def run_ga4_report(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ga4"})
+@mcp.tool(title="Analytics realtime report", annotations=_READONLY, tags={"ga4"})
 @_safe
 def run_realtime_report(
     dimensions: _StrListOpt = None,
@@ -439,7 +563,7 @@ def run_realtime_report(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ga4"})
+@mcp.tool(title="List Analytics events", annotations=_READONLY, tags={"ga4"})
 @_safe
 def get_tracking_events(
     date_range_start: str = "28daysAgo",
@@ -466,7 +590,7 @@ def get_tracking_events(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"gsc"})
+@mcp.tool(title="List Search Console properties", annotations=_READONLY, tags={"gsc"})
 @_safe
 def list_gsc_sites() -> dict:
     """List all Google Search Console properties the authenticated user can access.
@@ -480,7 +604,7 @@ def list_gsc_sites() -> dict:
     return _impl(current_config())
 
 
-@mcp.tool(annotations=_READONLY, tags={"gsc"})
+@mcp.tool(title="Search Console report", annotations=_READONLY, tags={"gsc"})
 @_safe
 def run_gsc_report(
     site_url: str = "",
@@ -530,7 +654,7 @@ def run_gsc_report(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"web"})
+@mcp.tool(title="PageSpeed analysis", annotations=_READONLY, tags={"web"})
 @_safe
 def analyze_page_speed(url: str, strategy: str = "mobile") -> dict:
     """Run PageSpeed Insights for a landing page — Lighthouse + real-user data.
@@ -549,7 +673,11 @@ def analyze_page_speed(url: str, strategy: str = "mobile") -> dict:
     return _impl(current_config(), url=url, strategy=strategy)
 
 
-@mcp.tool(annotations=_READONLY, tags={"merchant"})
+@mcp.tool(
+    title="List Merchant Center accounts",
+    annotations=_READONLY,
+    tags={"merchant"},
+)
 @_safe
 def list_merchant_accounts() -> dict:
     """List Google Merchant Center accounts the connected user can access.
@@ -562,7 +690,7 @@ def list_merchant_accounts() -> dict:
     return _impl(current_config())
 
 
-@mcp.tool(annotations=_READONLY, tags={"merchant"})
+@mcp.tool(title="Merchant Center feed health", annotations=_READONLY, tags={"merchant"})
 @_safe
 def get_merchant_feed_health(account_id: str) -> dict:
     """Merchant Center feed health — disapproved products + account issues.
@@ -581,7 +709,7 @@ def get_merchant_feed_health(account_id: str) -> dict:
     return _impl(current_config(), account_id=account_id)
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="List Google Ads accounts", annotations=_READONLY, tags={"ads"})
 @_safe
 def list_accounts(limit: int = 200) -> dict:
     """List accessible Google Ads accounts.
@@ -600,7 +728,7 @@ def list_accounts(limit: int = 200) -> dict:
     return _impl(current_config(), limit=limit)
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Campaign performance", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_campaign_performance(
     customer_id: str = "",
@@ -629,7 +757,7 @@ def get_campaign_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Ad performance", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_ad_performance(
     customer_id: str = "",
@@ -657,7 +785,7 @@ def get_ad_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Keyword performance", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_keyword_performance(
     customer_id: str = "",
@@ -685,7 +813,7 @@ def get_keyword_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Search terms report", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_search_terms(
     customer_id: str = "",
@@ -713,7 +841,7 @@ def get_search_terms(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="List negative keywords", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_negative_keywords(
     customer_id: str = "",
@@ -733,7 +861,11 @@ def get_negative_keywords(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(
+    title="List shared negative keyword lists",
+    annotations=_READONLY,
+    tags={"ads"},
+)
 @_safe
 def get_negative_keyword_lists(
     customer_id: str = "",
@@ -749,7 +881,11 @@ def get_negative_keyword_lists(
     return _impl(current_config(), customer_id=customer_id or current_config().ads.customer_id)
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(
+    title="Keywords in a negative keyword list",
+    annotations=_READONLY,
+    tags={"ads"},
+)
 @_safe
 def get_negative_keyword_list_keywords(
     shared_set_id: str,
@@ -768,7 +904,11 @@ def get_negative_keyword_list_keywords(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(
+    title="Campaigns using a negative keyword list",
+    annotations=_READONLY,
+    tags={"ads"},
+)
 @_safe
 def get_negative_keyword_list_campaigns(
     shared_set_id: str = "",
@@ -793,7 +933,7 @@ def get_negative_keyword_list_campaigns(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Google Ads recommendations", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_recommendations(
     customer_id: str = "",
@@ -822,7 +962,7 @@ def get_recommendations(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Performance Max performance", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_pmax_performance(
     customer_id: str = "",
@@ -853,7 +993,11 @@ def get_pmax_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(
+    title="Performance Max asset performance",
+    annotations=_READONLY,
+    tags={"ads"},
+)
 @_safe
 def get_asset_performance(
     customer_id: str = "",
@@ -882,7 +1026,11 @@ def get_asset_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(
+    title="Performance Max asset combinations",
+    annotations=_READONLY,
+    tags={"ads"},
+)
 @_safe
 def get_detailed_asset_performance(
     customer_id: str = "",
@@ -905,7 +1053,7 @@ def get_detailed_asset_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Audience performance", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_audience_performance(
     customer_id: str = "",
@@ -936,7 +1084,7 @@ def get_audience_performance(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Demographic targeting", annotations=_READONLY, tags={"ads"})
 @_safe
 def get_demographic_targeting(
     ad_group_id: str = "",
@@ -969,7 +1117,11 @@ def get_demographic_targeting(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"tracking"})
+@mcp.tool(
+    title="Campaign conversions against Analytics",
+    annotations=_READONLY,
+    tags={"tracking"},
+)
 @_safe
 def analyze_campaign_conversions(
     date_range_start: str = "",
@@ -999,7 +1151,7 @@ def analyze_campaign_conversions(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"tracking"})
+@mcp.tool(title="Landing page analysis", annotations=_READONLY, tags={"tracking"})
 @_safe
 def landing_page_analysis(
     date_range_start: str = "",
@@ -1025,7 +1177,7 @@ def landing_page_analysis(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"tracking"})
+@mcp.tool(title="Attribution check", annotations=_READONLY, tags={"tracking"})
 @_safe
 def attribution_check(
     date_range_start: str = "",
@@ -1056,7 +1208,7 @@ def attribution_check(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tracking coverage audit", annotations=_READONLY, tags={"gtm"})
 @_safe
 def audit_event_coverage(
     expected_events: list[str],
@@ -1109,7 +1261,7 @@ def audit_event_coverage(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager accounts", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_accounts() -> dict:
     """List all GTM accounts the AdLoop service account / OAuth user can read.
@@ -1124,7 +1276,7 @@ def list_gtm_accounts() -> dict:
     return _impl(current_config())
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager containers", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_containers(gtm_account_id: str = "") -> dict:
     """List all containers under a GTM account.
@@ -1144,7 +1296,7 @@ def list_gtm_containers(gtm_account_id: str = "") -> dict:
     return _impl(current_config(), account_id=gtm_account_id)
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager tags", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_tags(gtm_account_id: str = "", gtm_container_id: str = "") -> dict:
     """List every tag in the LIVE GTM container.
@@ -1164,7 +1316,7 @@ def list_gtm_tags(gtm_account_id: str = "", gtm_container_id: str = "") -> dict:
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tag Manager tag details", annotations=_READONLY, tags={"gtm"})
 @_safe
 def get_gtm_tag(
     tag_id: str, gtm_account_id: str = "", gtm_container_id: str = ""
@@ -1189,7 +1341,7 @@ def get_gtm_tag(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager triggers", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_triggers(gtm_account_id: str = "", gtm_container_id: str = "") -> dict:
     """List every trigger in the LIVE GTM container.
@@ -1209,7 +1361,7 @@ def list_gtm_triggers(gtm_account_id: str = "", gtm_container_id: str = "") -> d
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tag Manager trigger details", annotations=_READONLY, tags={"gtm"})
 @_safe
 def get_gtm_trigger(
     trigger_id: str, gtm_account_id: str = "", gtm_container_id: str = ""
@@ -1234,7 +1386,7 @@ def get_gtm_trigger(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager variables", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_variables(gtm_account_id: str = "", gtm_container_id: str = "") -> dict:
     """List GTM variables — both custom and enabled built-in.
@@ -1256,7 +1408,7 @@ def list_gtm_variables(gtm_account_id: str = "", gtm_container_id: str = "") -> 
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="List Tag Manager workspaces", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_workspaces(gtm_account_id: str = "", gtm_container_id: str = "") -> dict:
     """List workspaces (drafts) under a GTM container.
@@ -1276,7 +1428,7 @@ def list_gtm_workspaces(gtm_account_id: str = "", gtm_container_id: str = "") ->
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tag Manager workspace changes", annotations=_READONLY, tags={"gtm"})
 @_safe
 def get_gtm_workspace_diff(
     workspace_id: str, gtm_account_id: str = "", gtm_container_id: str = ""
@@ -1303,7 +1455,7 @@ def get_gtm_workspace_diff(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tag Manager version history", annotations=_READONLY, tags={"gtm"})
 @_safe
 def list_gtm_versions(
     gtm_account_id: str = "", gtm_container_id: str = "", page_size: int = 50
@@ -1329,7 +1481,7 @@ def list_gtm_versions(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"gtm"})
+@mcp.tool(title="Tag Manager version details", annotations=_READONLY, tags={"gtm"})
 @_safe
 def get_gtm_version(
     container_version_id: str, gtm_account_id: str = "", gtm_container_id: str = ""
@@ -1354,7 +1506,7 @@ def get_gtm_version(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Custom Google Ads query", annotations=_READONLY, tags={"ads"})
 @_safe
 def run_gaql(
     query: str,
@@ -1383,7 +1535,7 @@ def run_gaql(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft a campaign", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_campaign(
     campaign_name: str,
@@ -1450,7 +1602,7 @@ def draft_campaign(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft an ad group", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_ad_group(
     campaign_id: str,
@@ -1483,7 +1635,7 @@ def draft_ad_group(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft campaign changes", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_campaign(
     campaign_id: str,
@@ -1540,7 +1692,7 @@ def update_campaign(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft a responsive search ad", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_responsive_search_ad(
     ad_group_id: str,
@@ -1583,7 +1735,66 @@ def draft_responsive_search_ad(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Update a responsive search ad", annotations=_WRITE, tags={"ads"})
+@_safe
+def update_responsive_search_ad(
+    ad_id: str,
+    customer_id: str = "",
+    headlines: _StrOrDictListOpt = None,
+    descriptions: _StrOrDictListOpt = None,
+    final_url: str = "",
+    path1: str = "",
+    path2: str = "",
+    clear_path1: bool = False,
+    clear_path2: bool = False,
+) -> dict:
+    """Update mutable fields on an existing RSA in place — returns a PREVIEW.
+
+    Edits an existing RSA without creating a new ad; the ad keeps its ID.
+    Google Ads API v23 (``AdService.MutateAds``) permits in-place mutation of
+    ``final_urls``, ``path1``, ``path2``, ``headlines``, and ``descriptions``.
+
+    IMPORTANT: replacing headlines or descriptions is NOT a free in-place
+    edit. Even though the ad ID is preserved, swapping the creative text
+    RESETS the ad's asset-combination learning and performance history and
+    sends the ad BACK THROUGH Google policy review — Google treats the
+    creative as new for optimization. URL-only and path-only edits do not
+    incur this. When headlines/descriptions change, the returned preview
+    includes a ``warnings`` entry — surface it to the user before applying.
+
+    Headlines/descriptions are LIST-REPLACE — when provided, the supplied
+    list fully swaps in for the existing one, and Google's RSA constraints
+    apply (3-15 headlines, 2-4 descriptions, 30/90 char limits, pin-slot
+    rules). Each entry may be a plain string (unpinned) or
+    ``{"text": "...", "pinned_field": "HEADLINE_1"}``.
+
+    Argument semantics:
+        - ``headlines`` / ``descriptions``: None or [] -> no change;
+          non-empty list -> replaces the existing list in full
+        - ``final_url``: empty -> no change; non-empty -> replaces final URL
+        - ``path1`` / ``path2``: empty -> no change; non-empty -> sets value
+        - ``clear_path1`` / ``clear_path2``: True -> set to empty string
+
+    At least one mutation must be requested. Call confirm_and_apply with the
+    returned plan_id to execute.
+    """
+    from adloop.ads.write import update_responsive_search_ad as _impl
+
+    return _impl(
+        current_config(),
+        customer_id=customer_id or current_config().ads.customer_id,
+        ad_id=ad_id,
+        headlines=headlines,
+        descriptions=descriptions,
+        final_url=final_url,
+        path1=path1,
+        path2=path2,
+        clear_path1=clear_path1,
+        clear_path2=clear_path2,
+    )
+
+
+@mcp.tool(title="Draft keywords", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_keywords(
     ad_group_id: str,
@@ -1605,7 +1816,7 @@ def draft_keywords(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft negative keywords", annotations=_WRITE, tags={"ads"})
 @_safe
 def add_negative_keywords(
     campaign_id: str,
@@ -1630,7 +1841,7 @@ def add_negative_keywords(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft negative locations", annotations=_WRITE, tags={"ads"})
 @_safe
 def add_negative_locations(
     campaign_id: str,
@@ -1654,7 +1865,11 @@ def add_negative_locations(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(
+    title="Draft a shared negative keyword list",
+    annotations=_WRITE,
+    tags={"ads"},
+)
 @_safe
 def propose_negative_keyword_list(
     campaign_id: str,
@@ -1682,7 +1897,11 @@ def propose_negative_keyword_list(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(
+    title="Draft additions to a negative keyword list",
+    annotations=_WRITE,
+    tags={"ads"},
+)
 @_safe
 def add_to_negative_keyword_list(
     shared_set_id: str,
@@ -1715,7 +1934,7 @@ def add_to_negative_keyword_list(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft attaching a shared set", annotations=_WRITE, tags={"ads"})
 @_safe
 def attach_shared_set_to_campaigns(
     shared_set_id: str,
@@ -1746,7 +1965,7 @@ def attach_shared_set_to_campaigns(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft detaching a shared set", annotations=_WRITE, tags={"ads"})
 @_safe
 def detach_shared_set_from_campaigns(
     shared_set_id: str,
@@ -1777,7 +1996,7 @@ def detach_shared_set_from_campaigns(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft demographic targeting", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_demographic_targeting(
     customer_id: str = "",
@@ -1829,7 +2048,7 @@ def draft_demographic_targeting(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft ad group changes", annotations=_WRITE, tags={"ads"})
 @_safe
 def update_ad_group(
     ad_group_id: str,
@@ -1849,7 +2068,7 @@ def update_ad_group(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft callouts", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_callouts(
     campaign_id: str,
@@ -1867,7 +2086,7 @@ def draft_callouts(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft structured snippets", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_structured_snippets(
     campaign_id: str,
@@ -1885,7 +2104,7 @@ def draft_structured_snippets(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft image assets", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_image_assets(
     campaign_id: str,
@@ -1903,7 +2122,7 @@ def draft_image_assets(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft pausing an entity", annotations=_WRITE, tags={"ads"})
 @_safe
 def pause_entity(
     entity_type: str,
@@ -1931,7 +2150,7 @@ def pause_entity(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft enabling an entity", annotations=_WRITE, tags={"ads"})
 @_safe
 def enable_entity(
     entity_type: str,
@@ -1959,7 +2178,7 @@ def enable_entity(
     )
 
 
-@mcp.tool(annotations=_DESTRUCTIVE, tags={"ads"})
+@mcp.tool(title="Draft removing an entity", annotations=_DESTRUCTIVE, tags={"ads"})
 @_safe
 def remove_entity(
     entity_type: str,
@@ -1995,7 +2214,7 @@ def remove_entity(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft sitelinks", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_sitelinks(
     campaign_id: str,
@@ -2028,7 +2247,7 @@ def draft_sitelinks(
     )
 
 
-@mcp.tool(annotations=_DESTRUCTIVE, tags={"core"})
+@mcp.tool(title="Apply a previewed change", annotations=_DESTRUCTIVE, tags={"core"})
 @_safe
 def confirm_and_apply(
     plan_id: str,
@@ -2037,7 +2256,8 @@ def confirm_and_apply(
     """Execute a previously previewed change.
 
     IMPORTANT: Defaults to dry_run=True. You MUST explicitly pass dry_run=false
-    to make real changes to the Google Ads account.
+    to make real changes to the ad account (Google Ads or Reddit Ads — the
+    plan knows which platform it targets).
 
     Config override: if 'safety.require_dry_run: true' is set in the user's
     config file (default ~/.adloop/config.yaml), dry_run=false is IGNORED
@@ -2053,6 +2273,10 @@ def confirm_and_apply(
     DRY_RUN_REQUIRED until this plan_id has completed one dry_run=true
     pass. Run the dry run, show it to the user, then apply for real.
 
+    Reddit plans: Reddit has no validate-only mode, so the dry run re-reads
+    the target entity and re-checks the safety caps (returned as `checks`);
+    a DRY_RUN_FAILED result means the real apply would also fail.
+
     The plan_id comes from a prior draft_* or pause/enable tool call.
     """
     from adloop.ads.write import confirm_and_apply as _impl
@@ -2061,11 +2285,710 @@ def confirm_and_apply(
 
 
 # ---------------------------------------------------------------------------
+# Reddit Ads Tools
+# ---------------------------------------------------------------------------
+# Second ad platform. Every tool takes ``ad_account_id`` (falls back to
+# ``reddit.ad_account_id`` in the config); the name is deliberately not
+# ``account_id`` so scope enforcement never confuses it with Merchant Center.
+
+
+def _reddit_account(ad_account_id: str) -> str:
+    return ad_account_id or current_config().reddit.ad_account_id
+
+
+@mcp.tool(title="List Reddit ad accounts", annotations=_READONLY, tags={"reddit"})
+@_safe
+def list_reddit_accounts() -> dict:
+    """List Reddit businesses and ad accounts the connected Reddit user can access.
+
+    Call first to discover ad_account_id values (plus currency, time zone and
+    approval state) for every other Reddit tool. Requires the Reddit Ads
+    connection (adloop init → Reddit step, or Settings → Reddit Ads in Cloud).
+    """
+    from adloop.reddit.read import list_reddit_accounts as _impl
+
+    return _impl(current_config())
+
+
+@mcp.tool(
+    title="Reddit billing + posting profiles", annotations=_READONLY, tags={"reddit"}
+)
+@_safe
+def list_reddit_funding_instruments(ad_account_id: str = "") -> dict:
+    """Funding instruments (billing) and posting profiles of a Reddit ad account.
+
+    draft_reddit_campaign needs a servable funding_instrument_id; draft_reddit_ad
+    needs the profile_id that authors the post. Both come from here.
+    """
+    from adloop.reddit.read import list_reddit_funding_instruments as _impl
+
+    return _impl(current_config(), ad_account_id=_reddit_account(ad_account_id))
+
+
+@mcp.tool(title="Reddit campaigns", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_campaigns(ad_account_id: str = "", include_archived: bool = False) -> dict:
+    """List Reddit campaigns with status, objective, budget mode and bids.
+
+    Returns configured_status (what you set) and effective_status (what Reddit
+    computes: PENDING_APPROVAL, REJECTED, PENDING_BILLING_INFO, ...). Money is
+    in account currency. Budgets live on ad groups unless
+    is_campaign_budget_optimization is true.
+    """
+    from adloop.reddit.read import get_reddit_campaigns as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        include_archived=include_archived,
+    )
+
+
+@mcp.tool(title="Reddit ad groups", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_ad_groups(ad_account_id: str = "", campaign_id: str = "") -> dict:
+    """List Reddit ad groups (budget, bid, pixel, weekly schedule, targeting summary), optionally per campaign.
+
+    Reddit requires conversion_pixel_id on every ad group; insights flag ad
+    groups without one.
+    """
+    from adloop.reddit.read import get_reddit_ad_groups as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        campaign_id=campaign_id,
+    )
+
+
+@mcp.tool(title="Reddit ads", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_ads(
+    ad_account_id: str = "",
+    ad_group_id: str = "",
+    campaign_id: str = "",
+    include_copy: bool = False,
+) -> dict:
+    """List Reddit ads with status, rejection_reason, post and click URL.
+
+    include_copy=true adds each ad's post: type (TEXT, IMAGE, VIDEO, CAROUSEL),
+    headline, body, destination and media, one request per distinct post, so
+    creative can be reviewed without opening Reddit. Insights flag REJECTED
+    ads (policy review) and ads still PENDING_APPROVAL.
+    """
+    from adloop.reddit.read import get_reddit_ads as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        ad_group_id=ad_group_id,
+        campaign_id=campaign_id,
+        include_copy=include_copy,
+    )
+
+
+@mcp.tool(title="Reddit performance", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_performance(
+    ad_account_id: str = "",
+    level: str = "campaign",
+    date_range_start: str = "",
+    date_range_end: str = "",
+    breakdown: str = "",
+    compact: bool = False,
+) -> dict:
+    """Reddit Ads performance: spend, impressions, clicks, CTR, CPC, conversions, CPA, ROAS.
+
+    Returns: rows per entity for the chosen level with names joined, plus
+    totals and insights[] (zero-conversion spenders, rejected ads, empty windows).
+
+    level: "account", "campaign" (default), "ad_group" or "ad".
+    breakdown: optional extra dimension — "date", "hour", "country", "region",
+    "community", "keyword", "interest", "placement", "gender", "os_type".
+    Dates are YYYY-MM-DD; default is the last 30 days in the account's time
+    zone. 'conversions' is the account's key conversion event. Money is in
+    account currency. Data lags up to 6 hours.
+    compact=true: totals + top-10 rows + offender lists instead of every row.
+    """
+    from adloop.reddit.read import get_reddit_performance as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        level=level,
+        date_range_start=date_range_start,
+        date_range_end=date_range_end,
+        breakdown=breakdown,
+        compact=compact,
+    )
+
+
+@mcp.tool(title="Raw Reddit report", annotations=_READONLY, tags={"reddit"})
+@_safe
+def run_reddit_report(
+    fields: _StrList,
+    breakdowns: _StrListOpt = None,
+    ad_account_id: str = "",
+    date_range_start: str = "",
+    date_range_end: str = "",
+    filter: str = "",
+    time_zone_id: str = "",
+) -> dict:
+    """Run a custom Reddit Ads report for metrics get_reddit_performance omits.
+
+    fields: Reddit report field names, e.g. ["SPEND", "CLICKS", "REACH",
+    "VIDEO_STARTED", "CONVERSION_PURCHASE_TOTAL_VALUE", "KEY_CONVERSION_TOTAL_COUNT"].
+    breakdowns: up to 3 of DATE, HOUR, CAMPAIGN_ID, AD_GROUP_ID, AD_ID, COUNTRY,
+    REGION, COMMUNITY, KEYWORD, INTEREST, PLACEMENT, GENDER, OS_TYPE
+    (HOUR and DATE cannot be combined). Dates are account-local days.
+    filter: Reddit filter expression (e.g. "campaign_id==abc123").
+    Microcurrency fields are converted to currency amounts.
+    """
+    from adloop.reddit.read import run_reddit_report as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        fields=fields,
+        breakdowns=breakdowns,
+        date_range_start=date_range_start,
+        date_range_end=date_range_end,
+        filter=filter,
+        time_zone_id=time_zone_id,
+    )
+
+
+@mcp.tool(title="Reddit pixels", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_pixels(ad_account_id: str = "") -> dict:
+    """Reddit pixels of the account and when each event (purchase, sign_up, lead, ...) last fired.
+
+    Run before conversion-optimized campaigns: insights flag pixels that never
+    fired and ad groups optimizing for an event their pixel has never sent.
+    Every new ad group needs a conversion_pixel_id from here.
+    """
+    from adloop.reddit.read import get_reddit_pixels as _impl
+
+    return _impl(current_config(), ad_account_id=_reddit_account(ad_account_id))
+
+
+@mcp.tool(title="Search Reddit targeting", annotations=_READONLY, tags={"reddit"})
+@_safe
+def search_reddit_targeting(
+    kind: str, query: str = "", country: str = "", website_url: str = "", limit: int = 25
+) -> dict:
+    """Look up targeting options for draft_reddit_ad_group.
+
+    kind: "communities" (subreddits; query required), "interests" (query
+    filters by name), "geolocations" (country ISO code and/or city query),
+    "languages" (upper-case ISO 639-1 codes), "keywords" (comma-separated seed
+    terms → suggestions with Reddit-wide monthly views), or
+    "community_suggestions" (Reddit's related-community picks for seed
+    communities in query, e.g. "PPC,googleads", and/or a website_url).
+    Returns ids/names to pass into the targeting lists.
+    """
+    from adloop.reddit.read import search_reddit_targeting as _impl
+
+    return _impl(
+        current_config(), kind=kind, query=query, country=country, website_url=website_url, limit=limit
+    )
+
+
+@mcp.tool(title="Reddit account change history", annotations=_READONLY, tags={"reddit"})
+@_safe
+def get_reddit_account_history(
+    ad_account_id: str = "",
+    date_range_start: str = "",
+    date_range_end: str = "",
+    entity_type: str = "",
+    entity_ids: _StrListOpt = None,
+    limit: int = 100,
+) -> dict:
+    """Who changed what in the Reddit ad account: field, before/after, member, time.
+
+    The first thing to check when performance moves. Default window is the
+    last 30 days (account-local days). Optionally filter to one entity_type
+    ("campaign", "ad_group", "ad") with entity_ids; child entities are
+    included. Changes made through AdLoop show under the connected Reddit
+    user, like changes made in Ads Manager. Money fields are in account currency.
+    """
+    from adloop.reddit.read import get_reddit_account_history as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        date_range_start=date_range_start,
+        date_range_end=date_range_end,
+        entity_type=entity_type,
+        entity_ids=entity_ids,
+        limit=limit,
+    )
+
+
+@mcp.tool(title="Estimate a Reddit ad group", annotations=_READONLY, tags={"reddit"})
+@_safe
+def estimate_reddit_ad_group(
+    daily_budget: float | None = None,
+    lifetime_budget: float | None = None,
+    objective: str = "CLICKS",
+    bid_type: str = "CPC",
+    bid_strategy: str = "",
+    bid_value: float | None = None,
+    optimization_goal: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    geolocations: _StrListOpt = None,
+    excluded_geolocations: _StrListOpt = None,
+    communities: _StrListOpt = None,
+    excluded_communities: _StrListOpt = None,
+    interests: _StrListOpt = None,
+    keywords: _StrListOpt = None,
+    languages: _StrListOpt = None,
+    gender: str = "",
+    platforms: _StrListOpt = None,
+    ad_account_id: str = "",
+) -> dict:
+    """Audience size, delivery estimate and Reddit's suggested bid for a planned ad group — read-only.
+
+    Reddit's counterpart of estimate_budget: run it before draft_reddit_ad_group
+    with the same targeting and budget. Returns the reachable and targetable
+    audience (fixed 30-day basis), estimated impressions/clicks/reach for the
+    schedule (default: tomorrow for 30 days), and the minimum/suggested
+    bid range for bid_type in account currency. Nothing is created.
+    """
+    from adloop.reddit.read import estimate_reddit_ad_group as _impl
+
+    targeting = {
+        "geolocations": geolocations,
+        "excluded_geolocations": excluded_geolocations,
+        "communities": communities,
+        "excluded_communities": excluded_communities,
+        "interests": interests,
+        "keywords": keywords,
+        "languages": languages,
+        "gender": gender.upper() if gender else None,
+        "platforms": platforms,
+    }
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        objective=objective,
+        daily_budget=daily_budget,
+        lifetime_budget=lifetime_budget,
+        bid_type=bid_type,
+        bid_strategy=bid_strategy,
+        bid_value=bid_value,
+        optimization_goal=optimization_goal,
+        start_time=start_time,
+        end_time=end_time,
+        targeting=targeting,
+    )
+
+
+@mcp.tool(title="Draft pausing a Reddit entity", annotations=_WRITE, tags={"reddit"})
+@_safe
+def pause_reddit_entity(
+    entity_type: str, entity_id: str, ad_account_id: str = ""
+) -> dict:
+    """Draft pausing a Reddit campaign, ad group or ad — returns a PREVIEW.
+
+    entity_type: "campaign", "ad_group" or "ad"; entity_id from the read tools.
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.reddit.write import pause_reddit_entity as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        entity_type=entity_type,
+        entity_id=entity_id,
+    )
+
+
+@mcp.tool(title="Draft enabling a Reddit entity", annotations=_WRITE, tags={"reddit"})
+@_safe
+def enable_reddit_entity(
+    entity_type: str, entity_id: str, ad_account_id: str = ""
+) -> dict:
+    """Draft enabling (configured_status=ACTIVE) a Reddit campaign, ad group or ad — PREVIEW.
+
+    Enabling a new ad sends it to Reddit policy review (PENDING_APPROVAL).
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.reddit.write import enable_reddit_entity as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        entity_type=entity_type,
+        entity_id=entity_id,
+    )
+
+
+@mcp.tool(title="Draft archiving a Reddit entity", annotations=_DESTRUCTIVE, tags={"reddit"})
+@_safe
+def remove_reddit_entity(
+    entity_type: str, entity_id: str, ad_account_id: str = ""
+) -> dict:
+    """Draft ARCHIVING a Reddit campaign, ad group or ad — irreversible, PREVIEW.
+
+    Reddit has no hard delete for entities that ran; ARCHIVED is permanent.
+    Prefer pause_reddit_entity unless the user explicitly wants it gone.
+    Requires double confirmation. Call confirm_and_apply to execute.
+    """
+    from adloop.reddit.write import remove_reddit_entity as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        entity_type=entity_type,
+        entity_id=entity_id,
+    )
+
+
+@mcp.tool(title="Draft Reddit campaign changes", annotations=_WRITE, tags={"reddit"})
+@_safe
+def update_reddit_campaign(
+    campaign_id: str,
+    ad_account_id: str = "",
+    name: str = "",
+    daily_budget: float | None = None,
+    lifetime_budget: float | None = None,
+    spend_cap: float | None = None,
+    bid_strategy: str = "",
+    bid_type: str = "",
+    bid_value: float | None = None,
+    start_time: str = "",
+    end_time: str = "",
+    schedule: _DictListOpt = None,
+) -> dict:
+    """Draft changes to a Reddit campaign — name, run dates, spend cap, and (CBO only) budget/bid/schedule.
+
+    daily_budget / lifetime_budget / bid_* apply only when the campaign uses
+    campaign budget optimization; otherwise the budget lives on its ad groups
+    (use update_reddit_ad_group). Budgets are in account currency and checked
+    against max_daily_budget. The preview shows old → new per field.
+    schedule: weekly delivery windows ("time of day" in Ads Manager), a list
+    of blocks like {"days": "MON-FRI", "start_hour": 13, "end_hour": 23}
+    (day names, hours 0-23, end_hour inclusive) or the native
+    {"start_day": "FRI", "start_hour": 22, "end_day": "SAT", "end_hour": 3}.
+    [] clears it (deliver at any time). Hours apply in each viewer's local
+    time, not the account time zone.
+    """
+    from adloop.reddit.write import update_reddit_campaign as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        campaign_id=campaign_id,
+        name=name,
+        daily_budget=daily_budget,
+        lifetime_budget=lifetime_budget,
+        spend_cap=spend_cap,
+        bid_strategy=bid_strategy,
+        bid_type=bid_type,
+        bid_value=bid_value,
+        start_time=start_time,
+        end_time=end_time,
+        schedule=schedule,
+    )
+
+
+@mcp.tool(title="Draft Reddit ad group changes", annotations=_WRITE, tags={"reddit"})
+@_safe
+def update_reddit_ad_group(
+    ad_group_id: str,
+    ad_account_id: str = "",
+    name: str = "",
+    daily_budget: float | None = None,
+    lifetime_budget: float | None = None,
+    bid_value: float | None = None,
+    bid_strategy: str = "",
+    bid_type: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    geolocations: _StrListOpt = None,
+    excluded_geolocations: _StrListOpt = None,
+    communities: _StrListOpt = None,
+    excluded_communities: _StrListOpt = None,
+    interests: _StrListOpt = None,
+    keywords: _StrListOpt = None,
+    excluded_keywords: _StrListOpt = None,
+    languages: _StrListOpt = None,
+    gender: str = "",
+    platforms: _StrListOpt = None,
+    expand_targeting: bool | None = None,
+    schedule: _DictListOpt = None,
+    locations: _StrListOpt = None,
+) -> dict:
+    """Draft changes to a Reddit ad group — budget, bid, run dates, weekly schedule, targeting.
+
+    Budget (daily_budget or lifetime_budget + end_time) is checked against
+    max_daily_budget; bid_value against max_bid_increase_pct. Targeting lists
+    REPLACE the current value of each key you pass (pass the full list);
+    keys you omit are preserved. Ids/names come from search_reddit_targeting.
+    schedule: weekly delivery windows ("time of day" in Ads Manager), a list
+    of blocks like {"days": "MON-FRI", "start_hour": 13, "end_hour": 23}
+    (day names, hours 0-23, end_hour inclusive) or the native
+    {"start_day": "FRI", "start_hour": 22, "end_day": "SAT", "end_hour": 3}.
+    [] clears it (deliver at any time). Hours apply in each viewer's local
+    time, not the account time zone.
+    locations: placements, FEED and/or COMMENTS_PAGE (conversation pages).
+    """
+    from adloop.reddit.write import update_reddit_ad_group as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        ad_group_id=ad_group_id,
+        name=name,
+        daily_budget=daily_budget,
+        lifetime_budget=lifetime_budget,
+        bid_value=bid_value,
+        bid_strategy=bid_strategy,
+        bid_type=bid_type,
+        start_time=start_time,
+        end_time=end_time,
+        geolocations=geolocations,
+        excluded_geolocations=excluded_geolocations,
+        communities=communities,
+        excluded_communities=excluded_communities,
+        interests=interests,
+        keywords=keywords,
+        excluded_keywords=excluded_keywords,
+        languages=languages,
+        gender=gender,
+        platforms=platforms,
+        expand_targeting=expand_targeting,
+        schedule=schedule,
+        locations=locations,
+    )
+
+
+@mcp.tool(title="Draft Reddit ad changes", annotations=_WRITE, tags={"reddit"})
+@_safe
+def update_reddit_ad(
+    ad_id: str,
+    ad_account_id: str = "",
+    name: str = "",
+    click_url: str = "",
+    allow_comments: bool | None = None,
+) -> dict:
+    """Draft changes to a Reddit ad — name, landing URL (click_url), comments on/off.
+
+    click_url is verified to be reachable. The headline and body of a live
+    Reddit post cannot be edited; for new copy use draft_reddit_ad and pause
+    the old ad. Preview shows old → new; confirm_and_apply executes.
+    """
+    from adloop.reddit.write import update_reddit_ad as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        ad_id=ad_id,
+        name=name,
+        click_url=click_url,
+        allow_comments=allow_comments,
+    )
+
+
+@mcp.tool(title="Draft a Reddit campaign", annotations=_WRITE, tags={"reddit"})
+@_safe
+def draft_reddit_campaign(
+    campaign_name: str,
+    objective: str,
+    funding_instrument_id: str,
+    ad_account_id: str = "",
+    campaign_budget_optimization: bool = False,
+    daily_budget: float | None = None,
+    lifetime_budget: float | None = None,
+    bid_strategy: str = "",
+    bid_type: str = "",
+    bid_value: float | None = None,
+    optimization_goal: str = "",
+    conversion_pixel_id: str = "",
+    spend_cap: float | None = None,
+    start_time: str = "",
+    end_time: str = "",
+    schedule: _DictListOpt = None,
+) -> dict:
+    """Draft a new Reddit campaign (created PAUSED) — returns a PREVIEW.
+
+    objective: CLICKS, CONVERSIONS, IMPRESSIONS, LEAD_GENERATION, APP_INSTALLS,
+    CATALOG_SALES or VIDEO_VIEWABLE_IMPRESSIONS. funding_instrument_id from
+    list_reddit_funding_instruments. By default the budget lives on the ad
+    groups; set campaign_budget_optimization=true to hold it on the campaign
+    (then daily_budget or lifetime_budget, bid_strategy, bid_type and
+    conversion_pixel_id are required). Budgets are checked against
+    max_daily_budget. Times are ISO 8601. Follow up with draft_reddit_ad_group.
+    schedule: weekly delivery windows ("time of day" in Ads Manager), a list
+    of blocks like {"days": "MON-FRI", "start_hour": 13, "end_hour": 23}
+    (day names, hours 0-23, end_hour inclusive) or the native
+    {"start_day": "FRI", "start_hour": 22, "end_day": "SAT", "end_hour": 3}.
+    [] clears it (deliver at any time). Hours apply in each viewer's local
+    time, not the account time zone.
+    """
+    from adloop.reddit.write import draft_reddit_campaign as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        campaign_name=campaign_name,
+        objective=objective,
+        funding_instrument_id=funding_instrument_id,
+        campaign_budget_optimization=campaign_budget_optimization,
+        daily_budget=daily_budget,
+        lifetime_budget=lifetime_budget,
+        bid_strategy=bid_strategy,
+        bid_type=bid_type,
+        bid_value=bid_value,
+        optimization_goal=optimization_goal,
+        conversion_pixel_id=conversion_pixel_id,
+        spend_cap=spend_cap,
+        start_time=start_time,
+        end_time=end_time,
+        schedule=schedule,
+    )
+
+
+@mcp.tool(title="Draft a Reddit ad group", annotations=_WRITE, tags={"reddit"})
+@_safe
+def draft_reddit_ad_group(
+    campaign_id: str,
+    ad_group_name: str,
+    conversion_pixel_id: str,
+    ad_account_id: str = "",
+    daily_budget: float | None = None,
+    lifetime_budget: float | None = None,
+    bid_strategy: str = "",
+    bid_type: str = "",
+    bid_value: float | None = None,
+    optimization_goal: str = "",
+    geolocations: _StrListOpt = None,
+    excluded_geolocations: _StrListOpt = None,
+    communities: _StrListOpt = None,
+    excluded_communities: _StrListOpt = None,
+    interests: _StrListOpt = None,
+    keywords: _StrListOpt = None,
+    excluded_keywords: _StrListOpt = None,
+    languages: _StrListOpt = None,
+    gender: str = "",
+    platforms: _StrListOpt = None,
+    expand_targeting: bool | None = None,
+    start_time: str = "",
+    end_time: str = "",
+    schedule: _DictListOpt = None,
+    locations: _StrListOpt = None,
+) -> dict:
+    """Draft a new Reddit ad group (created PAUSED) — returns a PREVIEW.
+
+    Required: campaign_id, ad_group_name, conversion_pixel_id (Reddit rule;
+    from get_reddit_pixels) and at least one targeting list (geolocations,
+    communities, interests or keywords — ids/names from
+    search_reddit_targeting). For non-CBO campaigns also daily_budget (or
+    lifetime_budget + end_time), bid_strategy (BIDLESS, MANUAL_BIDDING,
+    MAXIMIZE_VOLUME, TARGET_CPX) and bid_type (CPC, CPM, CPV, CPV6, CPV15);
+    MANUAL_BIDDING/TARGET_CPX need bid_value. optimization_goal is the pixel
+    event to optimize for (PURCHASE, SIGN_UP, LEAD, PAGE_VISIT, ...).
+    Budgets are checked against max_daily_budget.
+
+    schedule: weekly delivery windows ("time of day" in Ads Manager), a list
+    of blocks like {"days": "MON-FRI", "start_hour": 13, "end_hour": 23}
+    (day names, hours 0-23, end_hour inclusive) or the native
+    {"start_day": "FRI", "start_hour": 22, "end_day": "SAT", "end_hour": 3}.
+    Omit for delivery at any time. Hours apply in each viewer's local time,
+    not the account time zone.
+    locations: placements, FEED and/or COMMENTS_PAGE (conversation pages).
+    """
+    from adloop.reddit.write import draft_reddit_ad_group as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        campaign_id=campaign_id,
+        ad_group_name=ad_group_name,
+        daily_budget=daily_budget,
+        lifetime_budget=lifetime_budget,
+        bid_strategy=bid_strategy,
+        bid_type=bid_type,
+        bid_value=bid_value,
+        optimization_goal=optimization_goal,
+        conversion_pixel_id=conversion_pixel_id,
+        geolocations=geolocations,
+        excluded_geolocations=excluded_geolocations,
+        communities=communities,
+        excluded_communities=excluded_communities,
+        interests=interests,
+        keywords=keywords,
+        excluded_keywords=excluded_keywords,
+        languages=languages,
+        gender=gender,
+        platforms=platforms,
+        expand_targeting=expand_targeting,
+        start_time=start_time,
+        end_time=end_time,
+        schedule=schedule,
+        locations=locations,
+    )
+
+
+@mcp.tool(title="Draft a Reddit ad", annotations=_WRITE, tags={"reddit"})
+@_safe
+def draft_reddit_ad(
+    ad_group_id: str,
+    profile_id: str = "",
+    headline: str = "",
+    click_url: str = "",
+    ad_account_id: str = "",
+    ad_name: str = "",
+    post_type: str = "TEXT",
+    body: str = "",
+    image_url: str = "",
+    call_to_action: str = "",
+    display_url: str = "",
+    allow_comments: bool = True,
+    post_id: str = "",
+) -> dict:
+    """Draft a Reddit ad: creates a post on the profile, then the ad (PAUSED) — PREVIEW.
+
+    profile_id from list_reddit_funding_instruments (profiles). post_type TEXT
+    (headline + optional body) or IMAGE (headline + public image_url).
+    click_url is verified to be reachable before drafting — never point ads
+    at unverified pages. call_to_action is one of Reddit's fixed labels
+    (Learn More, Sign Up, Shop Now, Download, ...). Comments are public on
+    Reddit ads; pass allow_comments=false to disable them.
+
+    post_id (t3_...) promotes an EXISTING post instead, keeping its upvotes
+    and comments: no post is created, headline/body/image are ignored, and
+    profile_id defaults to the post's. TEXT posts take no click_url (they
+    open themselves); media posts default click_url to the post's destination.
+    """
+    from adloop.reddit.write import draft_reddit_ad as _impl
+
+    return _impl(
+        current_config(),
+        ad_account_id=_reddit_account(ad_account_id),
+        ad_group_id=ad_group_id,
+        ad_name=ad_name,
+        profile_id=profile_id,
+        headline=headline,
+        post_type=post_type,
+        click_url=click_url,
+        body=body,
+        image_url=image_url,
+        call_to_action=call_to_action,
+        display_url=display_url,
+        allow_comments=allow_comments,
+        post_id=post_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tracking Tools
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_WRITE, tags={"ga4"})
+@mcp.tool(title="Draft an Analytics key event", annotations=_WRITE, tags={"ga4"})
 @_safe
 def draft_key_event(
     event_name: str,
@@ -2090,7 +3013,7 @@ def draft_key_event(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft a conversion action", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_create_conversion_action(
     name: str,
@@ -2143,7 +3066,7 @@ def draft_create_conversion_action(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft conversion action changes", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_update_conversion_action(
     conversion_action_id: str,
@@ -2190,7 +3113,7 @@ def draft_update_conversion_action(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft removing a conversion action", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_remove_conversion_action(
     conversion_action_id: str,
@@ -2291,7 +3214,7 @@ def draft_upload_enhanced_conversions_for_leads(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"tracking"})
+@mcp.tool(title="Validate tracking", annotations=_READONLY, tags={"tracking"})
 @_safe
 def validate_tracking(
     expected_events: _StrList,
@@ -2319,7 +3242,7 @@ def validate_tracking(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"tracking"})
+@mcp.tool(title="Generate tracking code", annotations=_READONLY, tags={"tracking"})
 @_safe
 def generate_tracking_code(
     event_name: str,
@@ -2354,7 +3277,7 @@ def generate_tracking_code(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Budget forecast", annotations=_READONLY, tags={"ads"})
 @_safe
 def estimate_budget(
     keywords: _DictList,
@@ -2391,7 +3314,7 @@ def estimate_budget(
     )
 
 
-@mcp.tool(annotations=_READONLY, tags={"ads"})
+@mcp.tool(title="Keyword ideas", annotations=_READONLY, tags={"ads"})
 @_safe
 def discover_keywords(
     seed_keywords: _StrList = [],  # noqa: B006 — mutable default required for MCP JSON schema

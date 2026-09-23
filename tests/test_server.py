@@ -47,25 +47,31 @@ def test_structured_error_detects_invalid_developer_token():
 
     result = _structured_error("list_accounts", error)
 
-    assert result["error"] == "Google Ads authentication failed — developer token is invalid."
+    assert result["error"] == "Google Ads authentication failed — the configured developer token is invalid."
     assert result["auth_error"] == "DEVELOPER_TOKEN_INVALID"
-    assert "ads.developer_token" in result["hint"]
+    # The fix is to drop the token, not to replace it.
+    assert "remove `ads.developer_token`" in result["hint"]
 
 
-def test_structured_error_detects_test_only_developer_token():
-    error = Exception(
-        "errors { error_code { authorization_error: DEVELOPER_TOKEN_NOT_APPROVED } "
-        'message: "The developer token is only approved for use with test accounts." }'
-    )
+def test_structured_error_points_test_level_projects_at_the_cloud_console():
+    # v25+ names the project; older API versions keep the token wording.
+    # Both mean the same thing since developer tokens were sunset.
+    for error in (
+        Exception(
+            "errors { error_code { authorization_error: CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION } "
+            'message: "The Google Cloud project is not approved for production accounts." }'
+        ),
+        Exception(
+            "errors { error_code { authorization_error: DEVELOPER_TOKEN_NOT_APPROVED } "
+            'message: "The developer token is only approved for use with test accounts." }'
+        ),
+    ):
+        result = _structured_error("list_accounts", error)
 
-    result = _structured_error("list_accounts", error)
-
-    assert result["error"] == (
-        "Google Ads authorization failed — developer token is not approved "
-        "for production accounts."
-    )
-    assert result["auth_error"] == "DEVELOPER_TOKEN_NOT_APPROVED"
-    assert "test accounts" in result["hint"]
+        assert result["auth_error"] == "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION"
+        assert "access level (Test)" in result["error"]
+        assert "console.cloud.google.com/google/ads-apis/overview" in result["hint"]
+        assert "Explorer" in result["hint"]
 
 
 def test_structured_error_detects_revoked_oauth_token():
@@ -90,16 +96,18 @@ def test_parse_gaql_error_detects_invalid_developer_token():
     assert "ads.developer_token" in result
 
 
-def test_parse_gaql_error_detects_test_only_developer_token():
-    error = Exception(
-        "errors { error_code { authorization_error: DEVELOPER_TOKEN_NOT_APPROVED } "
-        'message: "The developer token is only approved for use with test accounts." }'
-    )
+def test_parse_gaql_error_points_test_level_access_at_the_cloud_console():
+    for code in ("DEVELOPER_TOKEN_NOT_APPROVED", "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION"):
+        error = Exception(
+            f"errors {{ error_code {{ authorization_error: {code} }} "
+            'message: "Not approved for production accounts." }'
+        )
 
-    result = _parse_gaql_error(error)
+        result = _parse_gaql_error(error)
 
-    assert result.startswith("DEVELOPER_TOKEN_NOT_APPROVED:")
-    assert "test accounts" in result
+        assert result.startswith(f"{code}:")
+        assert "Google Ads API Overview" in result
+        assert "production" in result
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +321,45 @@ class TestNoStaleModuleConfig:
             runtime.set_default_config(None)
             preview_store.set_plan_store(InMemoryPlanStore())
 
+    @pytest.mark.asyncio
+    async def test_update_responsive_search_ad_tool_resolves_runtime_config(self):
+        from adloop import runtime
+        from adloop.config import AdLoopConfig, AdsConfig, SafetyConfig
+        from adloop.safety import preview as preview_store
+        from adloop.safety.preview import InMemoryPlanStore
+        from adloop.server import mcp
+
+        preview_store.set_plan_store(InMemoryPlanStore())
+        runtime.set_default_config(
+            AdLoopConfig(
+                ads=AdsConfig(customer_id="123-456-7890"),
+                safety=SafetyConfig(require_dry_run=True),
+            )
+        )
+        try:
+            tool = await mcp.get_tool("update_responsive_search_ad")
+            # A path-only edit avoids URL reachability checks and the
+            # learning-reset warning — keeps the call-through hermetic.
+            result = tool.fn(ad_id="999", path1="Pricing")
+            assert "error" not in result, result.get("error")
+            assert result["operation"] == "update_responsive_search_ad"
+            assert result["plan_id"]
+            # headlines/descriptions accept both plain strings and pinned dicts
+            # via the _StrOrDictListOpt coercion alias.
+            result2 = tool.fn(
+                ad_id="1000",
+                headlines=[
+                    "Fast Free Shipping",
+                    {"text": "Shop the Sale", "pinned_field": "HEADLINE_1"},
+                    "Save 20% Now",
+                ],
+            )
+            assert "error" not in result2, result2.get("error")
+            assert result2.get("warnings"), "text replace must warn"
+        finally:
+            runtime.set_default_config(None)
+            preview_store.set_plan_store(InMemoryPlanStore())
+
 
 class TestToolsets:
     """ADLOOP_TOOLSETS taxonomy + filtering (shared contract with AdLoop Cloud)."""
@@ -321,7 +368,7 @@ class TestToolsets:
         from adloop.server import TOOLSETS
 
         assert list(TOOLSETS) == [
-            "ads", "ga4", "tracking", "gtm", "gsc", "web", "merchant",
+            "ads", "ga4", "tracking", "gtm", "gsc", "web", "merchant", "reddit",
         ]
 
     @pytest.mark.asyncio

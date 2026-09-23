@@ -1,7 +1,7 @@
 # AdLoop configuration
 # Copy this file to ~/.adloop/config.yaml and fill in your values.
 #
-# Most users only need to set: developer_token, customer_id, login_customer_id.
+# Most users only need to set: customer_id (and login_customer_id with an MCC).
 # The setup wizard (adloop init) handles everything automatically.
 #
 # See README.md for detailed setup instructions.
@@ -22,10 +22,11 @@ ga4:
   property_id: ""
 
 ads:
-  # Google Ads API developer token.
-  # Find it in your MCC account → Tools & Settings → API Center.
-  # Explorer access (automatic) gives 2,880 operations/day.
-  # Apply for Basic access for 15,000 operations/day.
+  # Google Ads API access belongs to the Google Cloud project that owns your
+  # OAuth client (developer tokens were sunset in September 2026). Apply on
+  # the project's Google Ads API Overview page in the Cloud Console:
+  # Explorer (granted automatically) gives 2,880 operations/day, Basic
+  # 15,000/day. Leave the legacy token empty; it is ignored by the API.
   developer_token: ""
 
   # Default Google Ads customer ID (e.g. "123-456-7890").
@@ -59,6 +60,24 @@ pagespeed:
   # (APIs & Services -> Credentials) and enable "PageSpeed Insights API"
   # for a stable quota. No OAuth involved.
   api_key: ""
+
+reddit:
+  # Reddit Ads (optional). Reddit is a separate OAuth provider with its own
+  # developer app: Reddit Ads Manager -> Business Manager -> Developer
+  # Application -> Create app. Register the redirect URL exactly as
+  # http://localhost:8765/callback, then run `adloop init` and complete the
+  # Reddit Ads step; it writes the token file below. No approval process,
+  # no developer token. Rate limits are per Reddit user, not per app.
+  client_id: ""
+  client_secret: ""
+  # Default ad account for every Reddit tool (find it via list_reddit_accounts).
+  ad_account_id: ""
+  # Your Reddit username; only used to build the descriptive User-Agent that
+  # Reddit requires ("platform:app:version (by /u/name)").
+  username: ""
+  # Override the whole User-Agent string if you prefer.
+  user_agent: ""
+  token_path: "~/.adloop/reddit_token.json"
 
 safety:
   # Maximum daily budget allowed per campaign (in your account's currency).

@@ -33,9 +33,13 @@ _GOOGLE_CLOUD_INSTRUCTIONS = """\
 │     → https://console.cloud.google.com/apis/credentials         │
 │     Download the JSON file.                                     │
 │                                                                 │
-│  5. Get your Google Ads Developer Token from your MCC account   │
-│     → https://ads.google.com/aw/apicenter                      │
-│     (You need a Manager Account / MCC)                          │
+│  5. Apply for Google Ads API access ON THE PROJECT              │
+│     → https://console.cloud.google.com/google/ads-apis/overview │
+│     New projects start at Test level (test accounts only).      │
+│     "Upgrade access level": Explorer is granted automatically   │
+│     (2,880 ops/day); Basic (15,000/day) needs the consent       │
+│     screen published ("In production") first.                   │
+│     No manager account (MCC) and no developer token needed.     │
 └─────────────────────────────────────────────────────────────────┘
 """
 
@@ -77,9 +81,11 @@ def _validate_customer_id(raw: str) -> str | None:
     return None
 
 
-def _prompt_customer_id(label: str, default: str = "") -> str:
+def _prompt_customer_id(label: str, default: str = "", required: bool = True) -> str:
     while True:
-        value = _prompt(label, default=default)
+        value = _prompt(label, default=default, required=required)
+        if not value and not required:
+            return ""
         formatted = _format_customer_id(value)
         err = _validate_customer_id(formatted)
         if err:
@@ -151,6 +157,10 @@ def _generate_config_yaml(
     gtm_account_id: str = "",
     gtm_container_id: str = "",
     pagespeed_api_key: str = "",
+    reddit_client_id: str = "",
+    reddit_client_secret: str = "",
+    reddit_ad_account_id: str = "",
+    reddit_username: str = "",
 ) -> str:
     dry_run_str = "true" if require_dry_run else "false"
 
@@ -179,9 +189,10 @@ def _generate_config_yaml(
         f'  property_id: "{property_id}"',
         "",
         "ads:",
+        "  # Legacy; API access comes from the Google Cloud project since 2026-09.",
         f'  developer_token: "{developer_token}"',
         f'  customer_id: "{customer_id}"',
-        "  # MCC / Manager Account ID (required if using a manager account)",
+        "  # MCC / Manager Account ID (only if using a manager account)",
         f'  login_customer_id: "{login_customer_id}"',
         "",
         "gsc:",
@@ -198,6 +209,17 @@ def _generate_config_yaml(
         "pagespeed:",
         "  # Optional API key for analyze_page_speed (keyless works, low quota).",
         f'  api_key: "{pagespeed_api_key}"',
+        "",
+        "reddit:",
+        "  # Reddit Ads: your own developer app (Reddit Business Manager →",
+        "  # Developer Application). Token file is written by `adloop init`.",
+        f'  client_id: "{reddit_client_id}"',
+        f'  client_secret: "{reddit_client_secret}"',
+        "  # Default ad account for every Reddit tool (see list_reddit_accounts).",
+        f'  ad_account_id: "{reddit_ad_account_id}"',
+        "  # Your Reddit username, only used in the User-Agent Reddit requires.",
+        f'  username: "{reddit_username}"',
+        '  token_path: "~/.adloop/reddit_token.json"',
         "",
         "safety:",
         "  # Maximum daily budget AdLoop can set (safety cap)",
@@ -386,6 +408,92 @@ def _wizard_gsc_step(oauth_ok: bool, _existing) -> str:
     )
 
 
+def _wizard_reddit_step(_existing) -> dict[str, str]:
+    """Optionally connect Reddit Ads: own developer app, own OAuth, own token file.
+
+    Returns the ``reddit:`` values for the config. Reddit's redirect URI
+    must match the app exactly, so the loopback listener uses a fixed port
+    and the user registers precisely that URL on the app.
+    """
+    from adloop.reddit.auth import LOCAL_REDIRECT_URI
+
+    existing_id = _existing("reddit", "client_id")
+    values = {
+        "client_id": existing_id,
+        "client_secret": _existing("reddit", "client_secret"),
+        "ad_account_id": _existing("reddit", "ad_account_id"),
+        "username": _existing("reddit", "username"),
+    }
+    if not _prompt_bool("Connect Reddit Ads? (optional)", default=bool(existing_id)):
+        return values
+
+    _print()
+    _print("  Reddit Ads uses its own developer app (no approval, no developer token):")
+    _print("    1. Reddit Ads Manager → Business Manager → Developer Application → Create app")
+    _print(f"    2. Redirect URL: exactly {LOCAL_REDIRECT_URI}")
+    _print("    3. Copy the app ID and secret below")
+    _print()
+    values["client_id"] = _prompt("Reddit app ID", default=existing_id)
+    values["client_secret"] = _prompt(
+        "Reddit app secret", default=values["client_secret"]
+    )
+    values["username"] = _prompt(
+        "Your Reddit username (for the User-Agent Reddit requires)",
+        default=values["username"],
+        required=False,
+    )
+
+    from adloop.config import AdLoopConfig, RedditConfig
+
+    cfg = AdLoopConfig(
+        reddit=RedditConfig(
+            client_id=values["client_id"],
+            client_secret=values["client_secret"],
+            username=values["username"],
+        )
+    )
+    try:
+        from adloop.reddit.auth import run_local_authorization
+
+        run_local_authorization(cfg)
+        _print("  ✓ Reddit authorized; token saved to ~/.adloop/reddit_token.json")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        _print(f"  ✗ Reddit authorization failed: {exc}")
+        _print("    You can re-run `adloop init` later; the app credentials are kept.")
+        return values
+
+    try:
+        from adloop.reddit.read import list_reddit_accounts
+
+        accounts = list_reddit_accounts(cfg).get("accounts", [])
+        if not accounts:
+            _print("  No Reddit ad accounts visible to this user — set ad_account_id later.")
+        elif len(accounts) == 1:
+            acct = accounts[0]
+            _print(f"  ✓ Found Reddit ad account: {acct['name']} ({acct['ad_account_id']})")
+            if _prompt_bool("Use this ad account?", default=True):
+                values["ad_account_id"] = str(acct["ad_account_id"])
+        else:
+            values["ad_account_id"] = _prompt_choice(
+                "Select your Reddit ad account:",
+                [
+                    (
+                        str(a["ad_account_id"]),
+                        f"{a['name']} ({a['ad_account_id']}, {a.get('currency') or '?'}, "
+                        f"{a.get('business_name') or ''})",
+                    )
+                    for a in accounts
+                ],
+            )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        _print(f"  Could not list Reddit ad accounts ({exc}); set reddit.ad_account_id later.")
+    return values
+
+
 def _step_header(num: int, title: str) -> None:
     _print()
     _print(f"  ── Step {num}: {title} ──")
@@ -503,23 +611,29 @@ def run_init_wizard() -> None:
     )
 
     step_num = 4
-    _step_header(step_num, "Google Ads Developer Token")
-    _print("  Find your developer token in your MCC account:")
-    _print("  → https://ads.google.com/aw/apicenter")
+    _step_header(step_num, "Google Ads API access")
+    _print("  Since September 2026 API access belongs to your Google Cloud")
+    _print("  project, not to a developer token. Apply on the project's page:")
+    _print("  → https://console.cloud.google.com/google/ads-apis/overview")
+    _print("  Leave the token empty unless you still run an old setup.")
     _print()
     developer_token = _prompt(
-        "Developer Token",
+        "Developer token (legacy, optional)",
         default=_existing("ads", "developer_token"),
+        required=False,
     )
 
-    # MCC Account ID (needed before auto-discovery for Ads API calls)
+    # Manager account: optional since access no longer comes from an MCC.
+    # Still needed to reach several accounts through one login.
     step_num += 1
-    _step_header(step_num, "MCC / Manager Account")
-    _print("  Your MCC (Manager) account ID is in the top bar of your MCC.")
+    _step_header(step_num, "Manager Account (MCC), optional")
+    _print("  Only if you manage several accounts through a manager account:")
+    _print("  its ID is in the top bar of the MCC. Leave empty otherwise.")
     _print()
     login_customer_id = _prompt_customer_id(
         "MCC Account ID (XXX-XXX-XXXX)",
         default=_existing("ads", "login_customer_id"),
+        required=False,
     )
 
     # OAuth + auto-discovery
@@ -690,6 +804,11 @@ def _run_wizard_post_config(
         required=False,
     )
 
+    # Reddit Ads: a second ad platform with its own OAuth app and token file.
+    step_num += 1
+    _step_header(step_num, "Reddit Ads (optional)")
+    reddit_values = _wizard_reddit_step(_existing)
+
     # Safety defaults
     step_num += 1
     _step_header(step_num, "Safety Defaults")
@@ -726,6 +845,10 @@ def _run_wizard_post_config(
         gtm_account_id=gtm_account_id,
         gtm_container_id=gtm_container_id,
         pagespeed_api_key=pagespeed_api_key,
+        reddit_client_id=reddit_values["client_id"],
+        reddit_client_secret=reddit_values["client_secret"],
+        reddit_ad_account_id=reddit_values["ad_account_id"],
+        reddit_username=reddit_values["username"],
     )
     _CONFIG_PATH.write_text(config_yaml)
     _print(f"  ✓ Config written to {_CONFIG_PATH}")

@@ -22,9 +22,8 @@ def _enum_introspection_client():
     """Memoized no-auth GoogleAdsClient used purely for enum introspection.
 
     The client constructor doesn't make any network calls and doesn't
-    validate credentials beyond requiring SOMETHING in the developer-token
-    field — perfect for reading the bundled enum protos. We cache it so
-    every enum_names() call after the first is essentially free.
+    validate credentials — perfect for reading the bundled enum protos. We
+    cache it so every enum_names() call after the first is essentially free.
     """
     from google.ads.googleads.client import GoogleAdsClient
 
@@ -32,7 +31,6 @@ def _enum_introspection_client():
 
     return GoogleAdsClient(
         credentials=None,
-        developer_token="adloop-enum-introspection-not-used",
         use_proto_plus=True,
         version=GOOGLE_ADS_API_VERSION,
     )

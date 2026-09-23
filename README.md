@@ -1,25 +1,27 @@
+<!-- mcp-name: com.getadloop/adloop -->
+
 <div align="center">
 
 # AdLoop
 
-**The AI command center for Google Ads, GA4, and tracking code.**
+**The AI command center for Google Ads, Reddit Ads, GA4, and tracking code.**
 
 [![PyPI](https://img.shields.io/pypi/v/adloop.svg)](https://pypi.org/project/adloop/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-8A2BE2.svg)](https://modelcontextprotocol.io)
-[![Google Ads API](https://img.shields.io/badge/Google%20Ads-API%20v24-4285F4.svg?logo=google-ads&logoColor=white)](https://developers.google.com/google-ads/api/docs/start)
+[![Google Ads API](https://img.shields.io/badge/Google%20Ads-API%20v25-4285F4.svg?logo=google-ads&logoColor=white)](https://developers.google.com/google-ads/api/docs/start)
 [![GA4 Data API](https://img.shields.io/badge/GA4-Data%20API-E37400.svg?logo=google-analytics&logoColor=white)](https://developers.google.com/analytics/devguides/reporting/data/v1)
 [![GitHub stars](https://img.shields.io/github/stars/kLOsk/adloop?style=social)](https://github.com/kLOsk/adloop)
 
-An MCP server that gives your AI assistant read + write access to Google Ads and GA4 — with safety guardrails that prevent accidental spend.
+An MCP server that gives your AI assistant read + write access to Google Ads, Reddit Ads and GA4 — with safety guardrails that prevent accidental spend.
 
-**[☁️ Skip the setup — use AdLoop Cloud (free beta)](https://getadloop.com)** &nbsp;·&nbsp; or self-host: `pip install adloop`
+**[☁️ Skip the setup — use AdLoop Cloud (free plan, no card)](https://getadloop.com)** &nbsp;·&nbsp; or self-host: `pip install adloop`
 
 </div>
 
 > [!TIP]
-> **[AdLoop Cloud](https://getadloop.com) is the hosted version of this project — live now, free during beta (limited seats).** Connect Google in two clicks and use the full toolset from claude.ai, ChatGPT, Claude Code, Cursor, or Gemini. No Google Cloud project, no developer token, no OAuth verification wait. EU-hosted, GDPR-first, DPA included.
+> **[AdLoop Cloud](https://getadloop.com) is the hosted version of this project, with a free plan that needs no credit card.** Connect Google in two clicks and use the full toolset from claude.ai, ChatGPT, Claude Code, Cursor, or Gemini. No Google Cloud project, no API access application, no OAuth verification wait. EU-hosted, GDPR-first, DPA included.
 
 > 📚 **Documentation: [docs.getadloop.com](https://docs.getadloop.com)** — setup guides per AI client, toolsets, the safety model, and troubleshooting for both editions.
 
@@ -33,11 +35,11 @@ Both versions run the same tools with the same safety model. The difference is w
 |---|---|---|
 | **Setup** | Connect Google in two clicks | ~5 min: own Google Cloud project + `adloop init` |
 | **Google Cloud project** | Not needed | Required (free) |
-| **Ads developer token** | Not needed | Required (from your MCC) |
+| **Ads API access** | Not needed | Granted to your Cloud project (no developer token, no MCC since Sept 2026) |
 | **Works with** | claude.ai, ChatGPT, Claude Code, Cursor, Gemini | Claude Code, Cursor, Claude Desktop, any local MCP client |
 | **Where your data flows** | EU servers (Germany), GDPR-first, DPA included | 100% your machine — nothing leaves it |
 | **Updates** | Automatic | `pip install -U adloop` |
-| **Price** | Free during beta | Free forever (MIT) |
+| **Price** | Free plan, no card; [paid plans](https://getadloop.com/preise) for more accounts and volume | Free forever (MIT) |
 
 **Not sure? [Start with Cloud](https://getadloop.com)** — it's the fastest way to see what AdLoop can do, and it's the only way to use AdLoop from claude.ai or ChatGPT. Self-host when you want everything on your own machine or need to modify the code. And if you're here to hack on AdLoop itself: welcome, keep scrolling.
 
@@ -169,6 +171,27 @@ These tools read the live GTM container and join it with the codebase + GA4 to f
 
 > **Setup for GSC tools** — Enable the **Search Console API** in your GCP project. Upgrading OAuth users must re-authorize once for the new scope (delete `~/.adloop/token.json`, run any tool). The killer combo: cross-reference organic queries with `get_keyword_performance` to find paid/organic cannibalization and untapped keyword opportunities.
 
+### Reddit Ads Tools
+
+A second ad platform, same safety model. Reddit is a separate connection: its own developer app, its own OAuth, no developer token and no approval process. Every tool takes `ad_account_id` (defaults to `reddit.ad_account_id`).
+
+| Tool | What It Does |
+|------|-------------|
+| `list_reddit_accounts` | Discover businesses and ad accounts (currency, time zone, approval state) |
+| `list_reddit_funding_instruments` | Billing instruments and posting profiles — prerequisites for creating campaigns and ads |
+| `get_reddit_campaigns` / `get_reddit_ad_groups` / `get_reddit_ads` | Structure with configured vs effective status, budgets, bids, pixel, targeting, weekly schedule, rejection reasons; `include_copy` returns each ad's post (headline, body, destination, media) |
+| `get_reddit_performance` | Spend, clicks, CTR, CPC, conversions, CPA, ROAS per account/campaign/ad group/ad, optional breakdown (date, country, community, keyword, placement, …), compact mode with insights |
+| `run_reddit_report` | Raw reports endpoint for any metric (REACH, video, per-event conversions) |
+| `get_reddit_pixels` | Pixels and when each event last fired — flags ad groups optimizing for events the pixel never sent |
+| `search_reddit_targeting` | Communities, interests, geolocations, languages, keyword suggestions, and Reddit's related-community suggestions (by seed communities or website) |
+| `get_reddit_account_history` | Who changed what and when: field, before/after, member |
+| `estimate_reddit_ad_group` | Audience size, delivery estimate and suggested bid range for a planned ad group (Reddit's counterpart of `estimate_budget`) |
+| `pause_reddit_entity` / `enable_reddit_entity` / `remove_reddit_entity` | Status changes through the preview gate (remove = ARCHIVE, irreversible, double-confirmed) |
+| `update_reddit_campaign` / `update_reddit_ad_group` / `update_reddit_ad` | Budget, bid, run dates, weekly schedule (day names, viewer-local hours), targeting and placements (validated with Reddit at draft time), landing URL and comment changes with old → new previews, budget cap and bid-increase guards |
+| `draft_reddit_campaign` / `draft_reddit_ad_group` / `draft_reddit_ad` | Create campaign → ad group (pixel + targeting required) → post + ad, or promote an existing post with `post_id`. Everything is created **PAUSED**. |
+
+> **Setup for Reddit Ads tools** — In Reddit Ads Manager open **Business Manager → Developer Application → Create app** (business admins only; no approval wait). Register the redirect URL exactly as `http://localhost:8765/callback`, then run `adloop init` and complete the Reddit Ads step: it opens Reddit's consent page (scopes `adsread` + `adsedit`, permanent grant), stores the refresh token at `~/.adloop/reddit_token.json`, and lets you pick the default ad account. Reddit rate-limits per user (reporting: 60 requests/min) and requires a descriptive User-Agent, which AdLoop builds from your app id and Reddit username. Reddit has no validate-only mode, so `confirm_and_apply(dry_run=true)` re-reads the target and re-checks the safety caps instead.
+
 ### Planning Tools
 
 | Tool | What It Does |
@@ -249,7 +272,7 @@ AdLoop manages real ad spend, so safety is not optional.
 
 > **AdLoop uses your own (free) Google Cloud project for OAuth.** The `adloop init` wizard walks you through it — a one-time setup of about 5 minutes, with no shared user caps and no waiting on anyone's verification review. AdLoop does not ship built-in OAuth credentials.
 >
-> **Prefer zero setup?** [**AdLoop Cloud**](https://getadloop.com) is the hosted version: connect Google in two clicks — no Cloud project, no developer token, EU-hosted.
+> **Prefer zero setup?** [**AdLoop Cloud**](https://getadloop.com) is the hosted version: connect Google in two clicks — no Cloud project, no API access application, EU-hosted.
 >
 > *(Upgrading from ≤0.9 with built-in credentials? Those sign-ins were retired in 0.10 — run `adloop init` once to switch to your own project.)*
 
@@ -279,8 +302,8 @@ uv run adloop init
 The wizard walks you through:
 
 1. **Google Cloud setup** — creates a project, enables the three APIs, generates an OAuth client (see [Custom Google Cloud Project Setup](#custom-google-cloud-project-setup) below for the exact steps the wizard refers you to)
-2. **Developer token** — from your Google Ads MCC ([API Center](https://ads.google.com/aw/apicenter))
-3. **MCC Account ID** — your Manager Account ID (top bar in the MCC UI)
+2. **Google Ads API access** — applied for on your Cloud project's [Google Ads API Overview page](https://console.cloud.google.com/google/ads-apis/overview); the legacy developer-token prompt can be left empty
+3. **MCC Account ID** — optional, only if you reach several accounts through a Manager Account
 4. **OAuth sign-in** — opens a browser to sign in with Google (or prints a URL for headless servers)
 5. **Auto-discovers your accounts** — finds your GA4 properties and Ads accounts automatically
 6. **Optional services** — pin a GTM container, a Search Console property (both auto-discovered too), and a PageSpeed API key; skip any of them with Enter
@@ -291,26 +314,25 @@ The wizard walks you through:
 ### Requirements
 
 - Python 3.11+
-- A Google Ads account with an MCC (Manager Account)
-- A Google Ads Developer Token (see below)
+- A Google Ads account (a Manager Account is optional; you only need one to reach several accounts through one login)
+- Google Ads API access on your Google Cloud project (see below)
 
-### Google Ads Developer Token
+### Google Ads API access
 
-A developer token is **always required**. Your OAuth client handles Google sign-in; the developer token is a separate key that grants API access to your Google Ads data.
+Since 9 September 2026, Google Ads API access belongs to the **Google Cloud project that owns your OAuth client**. Developer tokens are sunset: the API ignores the header, the wizard's token prompt is optional, and you no longer need a Manager Account to get access.
 
-1. **Create an MCC** (free) at [ads.google.com/home/tools/manager-accounts](https://ads.google.com/home/tools/manager-accounts/) if you don't have one. Link your regular Google Ads account to it.
-2. In the MCC, go to **Tools & Settings → API Center**
-3. Your **developer token** is shown there. Copy it — the wizard will ask for it.
+Apply on your project's [Google Ads API Overview page](https://console.cloud.google.com/google/ads-apis/overview) in the Cloud Console:
 
-**Access levels** — your token's access level determines what it can do:
+| Level | How to get it | What it allows |
+|-------|---------------|----------------|
+| **Test** | Automatic when you enable the Google Ads API | Test accounts only, **not production accounts**. `CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION` (or `DEVELOPER_TOKEN_NOT_APPROVED` on older API versions) means you are here. |
+| **Explorer** | "Upgrade access level" → apply; usually granted automatically | 2,880 operations/day on production accounts. Enough to get started. |
+| **Basic** | Apply; reviewed automatically within minutes once the project is brand-verified (OAuth consent screen set to External and published "In production") | 15,000 operations/day. |
+| **Standard** | Apply; manual review, about ten business days | Higher limits; Google's RMF policy applies |
 
-| Level | How to Get | What It Allows |
-|-------|-----------|----------------|
-| **Test Account** | Default for new tokens | Can only access test accounts — **not production accounts**. If you see `DEVELOPER_TOKEN_NOT_APPROVED`, this is why. |
-| **Explorer** | Automatic after first API call with a production account | 2,880 operations/day on production accounts. Enough to get started. |
-| **Basic** | [Apply through API Center](https://ads.google.com/aw/apicenter) | 15,000 operations/day. Apply if you need more. |
+Projects on a Cloud free trial or with billing disabled are refused Explorer and Basic; use a project with billing set up.
 
-> **Getting `DEVELOPER_TOKEN_NOT_APPROVED`?** Your token is at "Test Account" level. Go to [API Center](https://ads.google.com/aw/apicenter) in your MCC and check your access level. If it shows "Test Account", you need to apply for Basic access or wait for Explorer access to be granted after your first production API call.
+> **Getting `CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION`?** Your project is at Test level. Open the Overview page above and apply for Explorer access.
 
 ### Headless Servers
 
@@ -415,9 +437,13 @@ All configuration lives in `~/.adloop/config.yaml`. See [`config.yaml.example`](
 | `google` | `credentials_path` | *(empty)* | Path to OAuth client JSON or service account key. Empty = `~/.adloop/credentials.json`, else Application Default Credentials. |
 | `google` | `token_path` | `~/.adloop/token.json` | Where to store the OAuth token (auto-created) |
 | `ga4` | `property_id` | — | Your GA4 property ID (auto-discovered by `adloop init`) |
-| `ads` | `developer_token` | — | Your Google Ads API developer token |
+| `ads` | `developer_token` | — | Legacy, optional: API access belongs to your Cloud project since Sept 2026 |
 | `ads` | `customer_id` | — | Default Google Ads customer ID (auto-discovered by `adloop init`) |
 | `ads` | `login_customer_id` | — | Your MCC account ID |
+| `reddit` | `client_id` / `client_secret` | *(empty)* | Your Reddit developer app (Business Manager → Developer Application) |
+| `reddit` | `ad_account_id` | *(empty)* | Default Reddit ad account for every Reddit tool (picked by `adloop init`) |
+| `reddit` | `username` | *(empty)* | Your Reddit username, used only in the User-Agent Reddit requires |
+| `reddit` | `token_path` | `~/.adloop/reddit_token.json` | Where the Reddit refresh token is stored |
 | `safety` | `max_daily_budget` | `50.00` | Maximum allowed daily budget per campaign |
 | `safety` | `require_dry_run` | `true` | Force all writes to dry-run mode |
 | `safety` | `two_phase_apply` | `false` | Refuse real applies until the plan had a dry-run pass |
@@ -440,6 +466,7 @@ Most MCP clients (claude.ai, ChatGPT, Cursor, …) load **every tool schema into
 | `gsc` | Search Console reads |
 | `web` | PageSpeed / Core Web Vitals |
 | `merchant` | Merchant Center feed health |
+| `reddit` | Reddit Ads reads, writes, and planning |
 
 `health_check` and `confirm_and_apply` are always included, whatever you select. Unset = the full catalog; unknown names fail at startup with the valid list. The effect is real: `ads,ga4` drops the session cost to ~13k tokens, and a `ga4`-only client pays ~2k — nearly 90% less. Toolsets are per *client*, not per install: one AdLoop config can serve a trimmed Cursor and a full-catalog Claude Code side by side.
 
@@ -450,7 +477,7 @@ On [AdLoop Cloud](https://getadloop.com), the same feature is per API key: pick 
 ```
 src/adloop/
 ├── __init__.py        # Entry point — routes 'adloop init' to wizard, otherwise starts MCP server
-├── server.py          # FastMCP server — 67 tool registrations with safety annotations
+├── server.py          # FastMCP server — every tool registration with safety annotations and toolset tags
 ├── config.py          # Config loader (~/.adloop/config.yaml)
 ├── auth.py            # OAuth 2.0 flow (user-supplied credentials, headless fallback) + service accounts; GA4 / Ads / GTM scopes
 ├── cli.py             # Interactive 'adloop init' setup wizard
@@ -470,6 +497,11 @@ src/adloop/
 ├── gtm/
 │   ├── client.py      # Google Tag Manager API v2 client
 │   └── read.py        # Live container fetching, tag/trigger/variable parsing, workspace diff, version history
+├── reddit/
+│   ├── auth.py        # Reddit OAuth2 (own app, permanent refresh token, loopback flow for adloop init)
+│   ├── client.py      # Reddit Ads API v3 REST client — bearer refresh, per-user rate limits, pagination
+│   ├── read.py        # Accounts, campaigns, ad groups, ads, performance reports, pixels, targeting lookups
+│   └── write.py       # Draft/preflight/apply for status, budget, bid, targeting, and PAUSED creation
 └── safety/
     ├── guards.py      # Budget caps, bid limits, blocked operations, Broad Match safety
     ├── preview.py     # Change plans and previews
@@ -491,7 +523,7 @@ What's been shipped and what's next:
 - ~~Claude Code support~~ ✓ — `CLAUDE.md`, `.mcp.json`, `.claude/rules/`, `.claude/commands/`, CLI wizard snippets
 - **Claude Desktop one-click install** — `adloop install claude-desktop` (and/or a `.dxt` extension bundle) that writes the AdLoop MCP entry into `claude_desktop_config.json` automatically, so Claude Desktop + Cowork users don't have to hand-edit JSON
 - ~~PyPI package~~ ✓ — `pip install adloop`
-- ~~[AdLoop Cloud](https://getadloop.com)~~ ✓ — the hosted version, live in beta: no Google Cloud project, no developer token, connect Google in two clicks (EU-hosted, GDPR-first)
+- ~~[AdLoop Cloud](https://getadloop.com)~~ ✓ — the hosted version: no Google Cloud project, no API access application, connect Google in two clicks (EU-hosted, GDPR-first)
 - ~~Headless server support~~ ✓ — manual URL copy-paste flow for servers without a browser
 - ~~Behavioral eval suites~~ ✓ — 28 prompt-and-expectation tests covering read, write, tracking, and planning workflows
 - ~~Google Tag Manager integration~~ ✓ — read tools for tags, triggers, variables, workspaces, and version history, plus the `audit_event_coverage` three-way join across codebase events, GTM tags, and GA4 actual fires
