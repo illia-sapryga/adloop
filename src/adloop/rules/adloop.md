@@ -92,6 +92,23 @@ These tools call both APIs internally and return unified results with computed `
 
 **GTM prerequisites:** the Tag Manager API must be enabled in the user's GCP project and their account needs at least Read access on the container. OAuth tokens granted before the GTM scope existed must be re-consented (delete `~/.adloop/token.json`, re-run any tool) — an `INSUFFICIENT_SCOPES` structured error means exactly that.
 
+### Google Tag Manager Write Tools (opt-in: `gtm.write_enabled`)
+
+| Tool | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `draft_gtm_tag` | Create a tag (no `tag_id`) or update one (`tag_id`) in a workspace. On update, `parameters` merge by key and every field you don't pass is preserved | `name`, `tag_type` (create only: `googtag`, `gaawe`, `awct`, `awcc`, `awud`, `sp`, `gclidw`, `flc`, `fls`, `img`, `html`, `cvt_<id>`), `parameters`, `firing_trigger_ids`, `blocking_trigger_ids`, `paused` |
+| `draft_gtm_trigger` | Create a trigger (no `trigger_id`) or update one | `name`, `trigger_type` (camelCase API values: `pageview`, `domReady`, `click`, `linkClick`, `formSubmission`, `customEvent`, `elementVisibility`, …), `custom_event_name`, `filters` |
+| `draft_delete_gtm_entity` | Delete a workspace tag or trigger. Referenced triggers are refused with the referencing tags listed | `entity_type` (`tag`/`trigger`), `entity_id` |
+| `draft_publish_gtm_workspace` | Publish a workspace LIVE. Preview lists every pending change — including other people's UI edits | `version_name`, `version_notes`, `workspace_id` |
+
+**GTM write rules:**
+- Writes are off unless the user sets `gtm.write_enabled: true`; enabling it asks for re-consent with the Tag Manager edit + publish scopes. The Google account also needs Edit (and Publish) permission on the container.
+- Tag/trigger drafts only change a **workspace**. Nothing changes on the site until `draft_publish_gtm_workspace` is applied — say so when presenting a tag preview.
+- **Custom HTML (`html`) is gated** by `gtm.allow_custom_html`: creating/editing one, or publishing a workspace that adds/changes one, is refused while it is off. Prefer a built-in template. Pausing or deleting an HTML tag is always allowed.
+- Always read before writing: `list_gtm_tags` / `list_gtm_triggers` for IDs, `get_gtm_workspace_diff` before publishing. Present the publish preview's `pending_changes` in full — the user is approving all of them, not just the ones AdLoop drafted.
+- Updates and deletes pin the entity fingerprint and publish pins the workspace state; if someone edits the container after the preview, apply refuses. Re-draft rather than retrying.
+- Prefer pausing a tag (`draft_gtm_tag` with `paused=true`) over deleting it.
+
 ### Google Search Console Read Tools (all read-only)
 
 | Tool | When to Use | Key Parameters |

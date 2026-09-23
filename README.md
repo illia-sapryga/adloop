@@ -145,6 +145,25 @@ These tools read the live GTM container and join it with the codebase + GA4 to f
 | `list_gtm_versions` | Publish history with version IDs and entity counts. Use to correlate a metric drop with a recent publish. |
 | `get_gtm_version` | Full metadata + tag/trigger names for a single historical container version |
 
+#### GTM write tools (opt-in)
+
+Off by default. Set `gtm.write_enabled: true` in `~/.adloop/config.yaml` and restart; the next call asks you to re-consent with the Tag Manager edit + publish scopes, which are never part of the default grant. Everything follows the usual draft → preview → `confirm_and_apply` flow, and tag/trigger edits only touch a workspace until you publish it.
+
+| Tool | What It Does |
+|------|-------------|
+| `draft_gtm_tag` | Create a tag, or update one by `tag_id`. Updates are a read-modify-write: `parameters` merge by key and every field you don't pass (priority, consent settings, firing options, schedule, folder, …) is preserved. Tag types are canonical GTM template IDs (`googtag`, `gaawe`, `awct`, `sp`, `gclidw`, …) or `cvt_<id>` gallery templates. |
+| `draft_gtm_trigger` | Create a trigger, or update one by `trigger_id` (type is immutable). `custom_event_name` wires a `customEvent` trigger to a dataLayer event. |
+| `draft_delete_gtm_entity` | Delete a workspace tag or trigger. Triggers still referenced by a tag are refused up front, with the tags listed. |
+| `draft_publish_gtm_workspace` | Publish a workspace live. The preview lists every pending change, including edits other people made in the GTM UI. |
+
+Safety gates specific to GTM:
+- **Custom HTML** runs arbitrary JavaScript on your site, so creating or editing an `html` tag — or publishing a workspace that adds or changes one — is refused unless `gtm.allow_custom_html: true` is also set. Pausing or deleting one is always allowed.
+- **No stale writes.** Updates and deletes pin the entity's fingerprint from the preview, and publish pins the workspace's pending changes; if someone edits the container in between, apply refuses and you re-draft.
+- Publishing stops on merge conflicts or GTM compiler errors, and `confirm_and_apply(dry_run=true)` re-checks all of the above against the live container without sending anything.
+- Per-operation names for `safety.blocked_operations`: `gtm_create_tag`, `gtm_update_tag`, `gtm_delete_tag`, `gtm_create_trigger`, `gtm_update_trigger`, `gtm_delete_trigger`, `gtm_publish_workspace`.
+
+The Google account also needs **Edit** permission on the container (and **Publish** to publish) under Admin → User Management.
+
 > **Setup for GTM tools** — Enable the **Tag Manager API v2** in your GCP project, then add your AdLoop credentials' email (the OAuth user, or the service account email if using a service account) as a **Read** user on the GTM container under Admin → User Management. Service accounts pick up access on the next call. **OAuth users upgrading from an earlier AdLoop version must re-authorize once**: the GTM scope is new, so delete `~/.adloop/token.json` and run any tool to re-consent — until then GTM tools return a permissions error.
 
 ### Search Console Tools
@@ -462,7 +481,7 @@ Most MCP clients (claude.ai, ChatGPT, Cursor, …) load **every tool schema into
 | `ads` | Google Ads reads, writes, and planning (Keyword Planner) |
 | `ga4` | Google Analytics reports, realtime, key events |
 | `tracking` | Cross-channel attribution + tracking code generation |
-| `gtm` | Google Tag Manager audits and reads |
+| `gtm` | Google Tag Manager audits, reads, and opt-in writes |
 | `gsc` | Search Console reads |
 | `web` | PageSpeed / Core Web Vitals |
 | `merchant` | Merchant Center feed health |
