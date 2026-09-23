@@ -3137,7 +3137,7 @@ def draft_remove_conversion_action(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft call conversion upload", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_upload_call_conversions(
     csv_path: str,
@@ -3175,7 +3175,7 @@ def draft_upload_call_conversions(
     )
 
 
-@mcp.tool(annotations=_WRITE, tags={"ads"})
+@mcp.tool(title="Draft enhanced conversions upload", annotations=_WRITE, tags={"ads"})
 @_safe
 def draft_upload_enhanced_conversions_for_leads(
     csv_path: str,
