@@ -63,15 +63,24 @@ def run_gaql(
 # ---------------------------------------------------------------------------
 
 _GAQL_ERROR_HINTS = {
+    "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION": (
+        "The Google Cloud project that owns your OAuth client only has Test "
+        "access, which cannot reach production Google Ads accounts. Apply for "
+        "Explorer or Basic access on the project's Google Ads API Overview "
+        "page: https://console.cloud.google.com/google/ads-apis/overview"
+    ),
+    # Pre-2026-09 wording: access levels moved from developer tokens to the
+    # Cloud project, but older API versions still answer with these names.
     "DEVELOPER_TOKEN_NOT_APPROVED": (
-        "Your Google Ads developer token is only approved for test accounts. "
-        "Apply for Basic or Standard access in the Google Ads API Center, "
-        "or use a test account."
+        "Your project's Google Ads API access is at Test level, which cannot "
+        "reach production accounts. Apply for Explorer or Basic access on the "
+        "Google Cloud project's Google Ads API Overview page: "
+        "https://console.cloud.google.com/google/ads-apis/overview"
     ),
     "DEVELOPER_TOKEN_INVALID": (
-        "Your Google Ads developer token is invalid. Update "
-        "`ads.developer_token` in `~/.adloop/config.yaml` using the token "
-        "from your manager account API Center."
+        "The configured `ads.developer_token` is invalid. Since September 2026 "
+        "no token is needed at all: remove it from `~/.adloop/config.yaml`; "
+        "access is granted to the Google Cloud project that owns your OAuth client."
     ),
     "EXPECTED_REFERENCED_FIELD_IN_SELECT_CLAUSE": (
         "Fields used in ORDER BY or HAVING must also appear in the SELECT clause. "

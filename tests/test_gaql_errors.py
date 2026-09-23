@@ -56,7 +56,7 @@ class TestParseGaqlError:
 
 class TestToPythonNestedMessages:
     def test_proto_plus_message_serializes_to_dict(self):
-        from google.ads.googleads.v24.common.types import LocationInfo
+        from google.ads.googleads.v25.common.types import LocationInfo
 
         info = LocationInfo(geo_target_constant="geoTargetConstants/2276")
         result = _to_python(info)
@@ -64,7 +64,7 @@ class TestToPythonNestedMessages:
         assert result["geo_target_constant"] == "geoTargetConstants/2276"
 
     def test_text_asset_shortcut_still_returns_plain_string(self):
-        from google.ads.googleads.v24.common.types import AdTextAsset
+        from google.ads.googleads.v25.common.types import AdTextAsset
 
         asset = AdTextAsset(text="Headline one")
         assert _to_python(asset) == "Headline one"
